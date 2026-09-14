@@ -1,0 +1,6 @@
+HST-Monitor-Session-Handoff.md
+Get-EntraSignIn.ps1
+*.code-workspace
+.vscode/
+*.log
+*.tmp
