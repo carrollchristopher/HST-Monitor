@@ -1,11 +1,13 @@
 # HST eChart Monitor
 
-Always-on availability monitor for the HST eChart sign-in endpoint, installed on a server at each site. It runs as a SYSTEM scheduled task, polls the endpoint through its redirects with curl, and emails when the site loses access, when it comes back, and when the monitor itself was not running.
+Always-on availability monitor for the HST eChart sign-in endpoint, installed on a server at each site. It runs as a SYSTEM scheduled task, polls the endpoint through its redirects with curl, and emails when the site loses access, when it stays slow, when it comes back, and when the monitor itself was not running.
 
 ## What it does
 
-- Polls the eChart URL every 30 seconds, follows the sign-in redirects, and checks that the page is populated.
-- Declares an outage after consecutive failures, emails DOWN, periodic STILL DOWN reminders, and RESOLVED with the outage length.
+- Polls the eChart URL every 10 seconds, follows the sign-in redirects, and checks that the page is populated.
+- Declares an outage after 3 failed polls in a row, emails DOWN, STILL DOWN every 30 minutes, and RESOLVED with the outage length.
+- Emails SLOW when at least half the polls in the last 5 minutes were slower than 3 seconds or failed, STILL SLOW every 30 minutes, and SLOW RESOLVED once 10 percent or fewer are. A single slow poll or timeout never emails.
+- Sends a daily summary at 7 AM of slow polls, failed polls with their reasons, outages, the worst response, and the busiest hour. It is sent only when something went wrong.
 - Writes a monthly latency CSV, an outages CSV, and `HST-eChart-Drops.log` with only the failures, slow polls, outage transitions, and alert delivery outcomes. Healthy polls never appear in the drops log.
 - Keeps a heartbeat so a restart after a reboot, a stopped task, or a killed process sends a MONITOR RESTARTED notice with the gap and the cause. An outage in progress at the last heartbeat is carried over.
 - Queues alerts that cannot be sent and retries them every minute for an hour.

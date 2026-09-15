@@ -68,6 +68,11 @@ $SlowThresholdMs       = 3000
 $DownThreshold         = 3
 $ReAlertMinutes        = 30
 $AlertOnRecovery       = $true
+$AlertOnSlow           = $true                         # Email when HST eChart stays slow or keeps failing without a full outage
+$SlowWindowMinutes     = 5                             # Rolling window the slow alert looks at
+$SlowAlertPercent      = 50                            # Share of polls in the window, slower than SlowThresholdMs or failed, that declares SLOW
+$SlowClearPercent      = 10                            # Share at or below which the slow period is over
+$DailySummaryHour      = 7                             # Local hour of the daily summary of slow and failed polls, sent only when something happened. -1 turns it off.
 $LogRetentionDays      = 30
 
 # Mail defaults. The wizard prompts for these interactively; in non-interactive mode they are used as-is.
@@ -103,6 +108,13 @@ $script:InstallerToken = $null                            # Last app-only token 
 $script:LastGraphSendError = ''                           # InvalidSecret, AccessDenied, or Other after a failed Graph send
 $script:MailTestSkipped = $false                          # Set when the test email failed and the operator chose to finish anyway
 $script:RetryTenantSetup = $false                         # Set when a secret minted this run was rejected, so the app prompt defaults to N
+
+# Alert settings normalised once, so the install summary and the generated monitor describe the same behaviour
+$DownThreshold         = [math]::Max(1, [int]$DownThreshold)
+$SlowWindowMinutes     = [math]::Max(1, [int]$SlowWindowMinutes)
+$SlowAlertPercent      = [math]::Min(100, [math]::Max(1, [int]$SlowAlertPercent))
+$SlowClearPercent      = [math]::Max(0, [math]::Min([int]$SlowClearPercent, $SlowAlertPercent - 1))
+$DailySummaryHour      = [math]::Min(23, [math]::Max(-1, [int]$DailySummaryHour))
 
 $HashTable_PowerShellTranscriptLogsbyKeyword = [Ordered]@{
     ADDED          = "ADDED |"
@@ -1209,6 +1221,11 @@ function New-MonitorContent {
         MARKER          = (& $q $ExpectedContentMarker)
         MINBYTES        = [string][math]::Max(1, [int]$MinPopulatedBytes)
         SLOWMS          = [string][math]::Max(0, [int]$SlowThresholdMs)
+        ALERTONSLOW     = (& $b $AlertOnSlow)
+        SLOWWINDOW      = [string][math]::Max(1, [int]$SlowWindowMinutes)
+        SLOWALERTPCT    = [string][math]::Min(100, [math]::Max(1, [int]$SlowAlertPercent))
+        SLOWCLEARPCT    = [string][math]::Max(0, [math]::Min([int]$SlowClearPercent, [math]::Min(100, [math]::Max(1, [int]$SlowAlertPercent)) - 1))
+        SUMMARYHOUR     = [string][math]::Min(23, [math]::Max(-1, [int]$DailySummaryHour))
         DOWNTHRESHOLD   = [string][math]::Max(1, [int]$DownThreshold)
         REALERT         = [string][math]::Max(0, [int]$ReAlertMinutes)
         RETENTIONDAYS   = [string][math]::Max(1, [int]$LogRetentionDays)
@@ -1268,6 +1285,9 @@ $Template_MonitorScript = @'
        outage transitions, alert delivery problems, and starts and restarts to HST-eChart-Drops.log, never a healthy poll.
     5. Tracks up and down state with true outage onset, alerts on state change with the site in the subject,
        re-alerts while still down, and on recovery emails the outage duration and writes an outage record.
+       Short of an outage, it emails SLOW when most polls over a rolling window are slow or failing, re-alerts
+       while still slow, emails SLOW RESOLVED when responses are back to normal, and once a day sends a
+       summary of slow and failed polls when there were any.
     6. Writes a heartbeat every poll. On start it reports how long it was not running, whether the server
        rebooted, and carries over any outage that was in progress. Alerts that cannot be sent are retried
        once a minute for an hour, and a recovery email says when the original DOWN alert never got out.
@@ -1276,7 +1296,7 @@ $Template_MonitorScript = @'
     Windows 10 1803+ or Windows Server 2019+ (ships with curl.exe).
 
 .OUTPUTS
-    Monthly latency CSV, outages CSV, drops log, daily transcript logs, and state-change email alerts.
+    Monthly latency CSV, outages CSV, drops log, daily transcript logs, state-change email alerts, and a daily summary.
 
 .NOTES
     Author:      Christopher Carroll
@@ -1300,6 +1320,7 @@ $InstallDir            = '@@INSTALLDIR@@'
 $OutageCsv             = '@@INSTALLDIR@@\HST-eChart-Outages.csv'
 $HeartbeatFile         = '@@INSTALLDIR@@\monitor-heartbeat.json'
 $DropLog               = '@@INSTALLDIR@@\HST-eChart-Drops.log'
+$SummaryStateFile      = '@@INSTALLDIR@@\daily-summary-sent.txt'
 $LogRetentionDays      = @@RETENTIONDAYS@@
 
 # Probe behavior
@@ -1315,6 +1336,11 @@ $SendEmail             = @@SENDEMAIL@@
 $DownThreshold         = @@DOWNTHRESHOLD@@
 $ReAlertMinutes        = @@REALERT@@
 $AlertOnRecovery       = @@ALERTONRECOVERY@@
+$AlertOnSlow           = @@ALERTONSLOW@@
+$SlowWindowMinutes     = @@SLOWWINDOW@@
+$SlowAlertPercent      = @@SLOWALERTPCT@@
+$SlowClearPercent      = @@SLOWCLEARPCT@@
+$DailySummaryHour      = @@SUMMARYHOUR@@
 
 # Mail
 $MailMethod            = '@@MAILMETHOD@@'
@@ -1687,6 +1713,198 @@ function Update-MonitorState {
     [PSCustomObject]@{ State = $s; EmailSubject = $emailSubject; EmailBody = $emailBody; EmailKind = $emailKind; OutageRecord = $outageRecord; TransitionLog = $transitionLog }
 }
 
+function Update-SlowState {
+    # Pure. Tracks slow or failed polls over a rolling window and decides the SLOW, STILL SLOW, and SLOW RESOLVED
+    # emails. SLOW needs the window at least half covered, three bad polls, and the alert share. The period ends when
+    # the share drops to the clear share. An outage owns its polls: while DOWN the window is emptied and a slow period
+    # in progress is closed without an email, so the outage emails tell that story.
+    param(
+        [Parameter(Mandatory)][hashtable]$State,
+        [Parameter(Mandatory)][object]$Result,
+        [Parameter(Mandatory)][bool]$Failed,
+        [Parameter(Mandatory)][bool]$IsDown,
+        [Parameter(Mandatory)][datetime]$NowUtc,
+        [int]$SlowThresholdMs = 3000,
+        [int]$WindowMinutes = 5,
+        [int]$AlertPercent = 50,
+        [int]$ClearPercent = 10,
+        [int]$ReAlertMinutes = 30,
+        [bool]$AlertOnRecovery = $true,
+        [string]$SiteName,
+        [string]$Url,
+        [string]$HostName
+    )
+    $WindowMinutes = [math]::Max(1, $WindowMinutes)
+    $siteLabel = if ($HostName) { "$SiteName ($HostName)" } else { $SiteName }
+    $s = @{
+        Samples        = New-Object System.Collections.ArrayList
+        IsSlow         = [bool]$State.IsSlow
+        StartUtc       = $State.StartUtc
+        StartLocalStr  = $State.StartLocalStr
+        LastAlertUtc   = $State.LastAlertUtc
+        Polls          = [int]$State.Polls
+        SlowPolls      = [int]$State.SlowPolls
+        FailedPolls    = [int]$State.FailedPolls
+        WorstMs        = [int]$State.WorstMs
+        AlertDelivered = $State.AlertDelivered
+    }
+    $emailKind = $null; $emailSubject = $null; $emailBody = $null; $transitionLog = $null; $dropKind = $null
+    $windowStart = $NowUtc.AddMinutes(-$WindowMinutes)
+    foreach ($x in @($State.Samples)) { if ($x -and $x.Utc -gt $windowStart) { [void]$s.Samples.Add($x) } }
+    $closePeriod = { $s.IsSlow = $false; $s.StartUtc = $null; $s.StartLocalStr = $null; $s.LastAlertUtc = $null; $s.Polls = 0; $s.SlowPolls = 0; $s.FailedPolls = 0; $s.WorstMs = 0; $s.AlertDelivered = $null }
+
+    if ($IsDown) {
+        if ($s.IsSlow) {
+            $transitionLog = "Slow period for $SiteName since $($s.StartLocalStr) local ended in an outage."
+            $dropKind = 'SLOWCLEAR'
+        }
+        & $closePeriod
+        $s.Samples.Clear()
+        return [PSCustomObject]@{ State = $s; EmailKind = $null; EmailSubject = $null; EmailBody = $null; TransitionLog = $transitionLog; DropKind = $dropKind }
+    }
+
+    $ms = if ($null -ne $Result.TotalMs -and "$($Result.TotalMs)" -ne '') { [int]$Result.TotalMs } else { $null }
+    $slowPoll = (-not $Failed) -and ($null -ne $ms) -and ($ms -ge $SlowThresholdMs)
+    [void]$s.Samples.Add([PSCustomObject]@{ Utc = $NowUtc; LocalStr = [string]$Result.Timestamp_Local; Slow = $slowPoll; Failed = $Failed; Ms = $ms })
+
+    $total = $s.Samples.Count
+    $bad = @($s.Samples | Where-Object { $_.Slow -or $_.Failed })
+    $share = [int][math]::Floor(100 * $bad.Count / $total)
+    $okMs = @($s.Samples | Where-Object { -not $_.Failed -and $null -ne $_.Ms } | ForEach-Object { [int]$_.Ms } | Sort-Object)
+    $timing = if ($okMs.Count) { "median $($okMs[[int][math]::Floor(($okMs.Count - 1) / 2)]) ms, worst $($okMs[-1]) ms" } else { 'no successful polls' }
+    $slowCount = @($s.Samples | Where-Object { $_.Slow }).Count
+    $failedCount = @($s.Samples | Where-Object { $_.Failed }).Count
+    $windowText = "$total polls in $WindowMinutes min: $slowCount slower than $SlowThresholdMs ms, $failedCount failed"
+    $lastPoll = "HTTP $($Result.HttpCode), $(if ($null -ne $ms) { "$ms ms" } else { 'no timing' }), $($Result.Reason)"
+    $deliveryNote = if ($s.AlertDelivered) { 'Delivered' } else { 'Not delivered. This server had no working mail path earlier, so this is the first notice.' }
+
+    if ($s.IsSlow) {
+        $s.Polls++
+        if ($slowPoll) { $s.SlowPolls++ }
+        if ($Failed) { $s.FailedPolls++ }
+        if ($slowPoll -or (-not $Failed -and $null -ne $ms)) { if ($ms -gt $s.WorstMs) { $s.WorstMs = $ms } }
+        # A period carried over a restart starts with an empty window, so nothing is decided until it is half covered again
+        $covered = ($NowUtc - $s.Samples[0].Utc).TotalSeconds -ge ($WindowMinutes * 30)
+        if ($covered -and $share -le $ClearPercent) {
+            # The period ended at the first good poll after the last bad one, not when the window finally cleared
+            $lastBad = -1
+            for ($k = $s.Samples.Count - 1; $k -ge 0; $k--) { if ($s.Samples[$k].Slow -or $s.Samples[$k].Failed) { $lastBad = $k; break } }
+            if ($lastBad -eq $s.Samples.Count - 1) { $normalUtc = $NowUtc; $normalLocal = [string]$Result.Timestamp_Local; $tail = 0 }
+            else { $normalUtc = $s.Samples[$lastBad + 1].Utc; $normalLocal = $s.Samples[$lastBad + 1].LocalStr; $tail = $s.Samples.Count - 1 - $lastBad }
+            $span = $normalUtc - $s.StartUtc
+            if ($span.Ticks -lt 0) { $span = [TimeSpan]::Zero }
+            $duration = Format-Duration $span
+            $pollsWhileSlow = [math]::Max(0, $s.Polls - $tail)
+            $transitionLog = "Slow period over for ${SiteName}: lasted $duration, $pollsWhileSlow polls, $($s.SlowPolls) slow, $($s.FailedPolls) failed, worst $($s.WorstMs) ms."
+            $dropKind = 'SLOWCLEAR'
+            if ($AlertOnRecovery) {
+                $emailKind = 'SlowResolved'
+                $emailSubject = "[HST SLOW RESOLVED] $siteLabel - slow period lasted $duration"
+                $emailBody = New-AlertBody -Heading "HST eChart is responding normally again from $SiteName" -Details ([ordered]@{ 'Status' = 'SLOW RESOLVED'; 'Site' = $SiteName; 'Server' = $HostName; 'Endpoint' = $Url; 'Slow from' = "$($s.StartLocalStr) local"; 'Normal from' = "$normalLocal local"; 'Duration' = $duration; 'Polls while slow' = "${pollsWhileSlow}: $($s.SlowPolls) slower than $SlowThresholdMs ms, $($s.FailedPolls) failed"; 'Worst response' = "$($s.WorstMs) ms"; 'Last poll' = $lastPoll; 'SLOW alert' = $deliveryNote })
+            }
+            & $closePeriod
+        }
+        elseif ($covered -and $ReAlertMinutes -gt 0 -and $null -ne $s.LastAlertUtc -and ($NowUtc - $s.LastAlertUtc).TotalMinutes -ge $ReAlertMinutes) {
+            $s.LastAlertUtc = $NowUtc
+            $elapsed = Format-Duration ($NowUtc - $s.StartUtc)
+            $emailKind = 'SlowReminder'
+            $emailSubject = "[HST STILL SLOW] $siteLabel - slow for $elapsed"
+            $emailBody = New-AlertBody -Heading "HST eChart is still slow from $SiteName" -Details ([ordered]@{ 'Status' = 'STILL SLOW'; 'Site' = $SiteName; 'Server' = $HostName; 'Endpoint' = $Url; 'Slow since' = "$($s.StartLocalStr) local"; 'Slow for' = $elapsed; 'Polls while slow' = "$($s.Polls): $($s.SlowPolls) slower than $SlowThresholdMs ms, $($s.FailedPolls) failed"; 'Worst response' = "$($s.WorstMs) ms"; "Last $WindowMinutes min" = "$windowText, $timing"; 'Last poll' = $lastPoll; 'Earlier alerts' = $deliveryNote })
+            $transitionLog = "Reminder raised for $SiteName, slow for $elapsed."
+            $dropKind = 'SLOWSTILL'
+        }
+    }
+    elseif ($bad.Count -ge 3 -and $share -ge $AlertPercent -and ($NowUtc - $s.Samples[0].Utc).TotalSeconds -ge ($WindowMinutes * 30)) {
+        $first = $bad[0]
+        $s.IsSlow = $true
+        $s.StartUtc = $first.Utc
+        $s.StartLocalStr = $first.LocalStr
+        $s.LastAlertUtc = $NowUtc
+        $s.AlertDelivered = $false
+        $s.Polls = $total
+        $s.SlowPolls = $slowCount
+        $s.FailedPolls = $failedCount
+        $s.WorstMs = if ($okMs.Count) { [int]$okMs[-1] } else { 0 }
+        $emailKind = 'Slow'
+        $emailSubject = "[HST SLOW] $siteLabel - $($bad.Count) of $total polls slow or failed in $WindowMinutes min"
+        $emailBody = New-AlertBody -Heading "HST eChart is slow from $SiteName" -Details ([ordered]@{ 'Status' = 'SLOW'; 'Site' = $SiteName; 'Server' = $HostName; 'Endpoint' = $Url; 'Slow since' = "$($first.LocalStr) local"; "Last $WindowMinutes min" = $windowText; 'Response time' = $timing; 'Last poll' = $lastPoll; 'Backend IP' = $Result.RemoteIp; 'Clears when' = "$ClearPercent% or fewer of the polls in $WindowMinutes min are slow or failed" })
+        $transitionLog = "Declared SLOW for ${SiteName}: $windowText ($timing)."
+        $dropKind = 'SLOWSTART'
+    }
+
+    [PSCustomObject]@{ State = $s; EmailKind = $emailKind; EmailSubject = $emailSubject; EmailBody = $emailBody; TransitionLog = $transitionLog; DropKind = $dropKind }
+}
+
+function Test-DailySummaryDue {
+    # Pure. True once a day at or after the summary hour, when no summary was recorded for that date
+    param([Parameter(Mandatory)][datetime]$NowLocal, [int]$Hour, [string]$LastSentDate)
+    if ($Hour -lt 0 -or $NowLocal.Hour -lt $Hour) { return $false }
+    return ($LastSentDate -ne $NowLocal.ToString('yyyy-MM-dd'))
+}
+
+function Get-DailySummary {
+    # Pure. Summarises the drops log lines from the 24 hours before NowLocal. Returns $null when nothing went wrong.
+    param([string[]]$Lines, [Parameter(Mandatory)][datetime]$NowLocal, [int]$SlowThresholdMs = 3000, [string]$SiteName, [string]$HostName, [string]$Url)
+    $from = $NowLocal.AddHours(-24)
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    $failed = 0; $slow = 0; $worst = 0; $downs = 0; $slowPeriods = 0; $restarts = 0; $errors = 0; $open = $false
+    $reasons = @{}; $hours = @{}
+    $outages = New-Object System.Collections.ArrayList
+    foreach ($line in @($Lines)) {
+        if ("$line" -notmatch '^\uFEFF?(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) \| (\w+) +\| (.*)$') { continue }
+        $kind = $Matches[2]; $text = $Matches[3]
+        $t = [datetime]::MinValue
+        if (-not [datetime]::TryParseExact($Matches[1], 'yyyy-MM-dd HH:mm:ss', $inv, [System.Globalization.DateTimeStyles]::None, [ref]$t)) { continue }
+        if ($t -le $from -or $t -gt $NowLocal) { continue }
+        if ($kind -eq 'FAIL' -or $kind -eq 'SLOW') { $h = $t.ToString('HH'); $hours[$h] = 1 + [int]$hours[$h] }
+        if ($kind -eq 'FAIL') {
+            $failed++
+            $r = if ($text -match 'Reason=(.+)$') { $Matches[1].Trim() } else { 'unknown' }
+            $reasons[$r] = 1 + [int]$reasons[$r]
+        }
+        elseif ($kind -eq 'SLOW') { $slow++; if ($text -match 'Total=(\d+)ms' -and [int]$Matches[1] -gt $worst) { $worst = [int]$Matches[1] } }
+        elseif ($kind -eq 'DOWN') { $downs++; $open = $true }
+        elseif ($kind -eq 'RESOLVED') {
+            # An outage whose DOWN line is older than the window still counts once, with its length
+            if (-not $open) { $downs++ }
+            if ($text -match 'lasted (.+?) over') { [void]$outages.Add($Matches[1]) }
+            $open = $false
+        }
+        elseif ($kind -eq 'REMINDER' -or ($kind -eq 'CARRYOVER' -and $text -like 'Outage in progress*')) { if (-not $open) { $downs++; $open = $true } }
+        elseif ($kind -eq 'SLOWSTART') { $slowPeriods++ }
+        elseif ($kind -eq 'RESTART') { $restarts++ }
+        elseif ($kind -eq 'ERROR') { $errors++ }
+    }
+    if (($failed + $slow + $downs + $slowPeriods + $restarts + $errors) -eq 0) { return $null }
+    $count = { param([int]$n, [string]$word) if ($n -eq 1) { "1 $word" } else { "$n ${word}s" } }
+    $details = [ordered]@{
+        'Site'         = $SiteName
+        'Server'       = $HostName
+        'Period'       = "$($from.ToString('yyyy-MM-dd HH:mm')) to $($NowLocal.ToString('yyyy-MM-dd HH:mm')) local"
+        'Slow polls'   = if ($slow) { "$slow slower than $SlowThresholdMs ms, worst $worst ms" } else { 'None' }
+        'Failed polls' = if ($failed) { "$failed (" + ((@($reasons.GetEnumerator() | Sort-Object Value -Descending | ForEach-Object { "$($_.Key) x$($_.Value)" })) -join ', ') + ")" } else { 'None' }
+        'Outages'      = if ($downs) { "$downs$(if ($outages.Count) { ', lasting ' + ($outages -join ', ') })$(if ($open) { ', one still in progress' })" } else { 'None' }
+        'Slow periods' = if ($slowPeriods) { "$slowPeriods" } else { 'None' }
+    }
+    if ($hours.Count) {
+        $top = $hours.GetEnumerator() | Sort-Object Value -Descending | Select-Object -First 1
+        $details['Busiest hour'] = "$($top.Key):00 to $($top.Key):59, $($top.Value) slow or failed polls"
+    }
+    if ($restarts) { $details['Monitor restarts'] = "$restarts" }
+    if ($errors) { $details['Monitor errors'] = "$errors" }
+    $details['Endpoint'] = $Url
+    $details['Details'] = "HST-eChart-Drops.log on $HostName"
+    [PSCustomObject]@{
+        Subject      = "[HST DAILY] $SiteName ($HostName) - $(& $count $slow 'slow poll'), $(& $count $failed 'failed poll'), $(& $count $downs 'outage') in 24 hours"
+        Body         = (New-AlertBody -Heading "HST eChart daily summary for $SiteName" -Details $details)
+        SlowPolls    = $slow
+        FailedPolls  = $failed
+        Outages      = $downs
+        SlowPeriods  = $slowPeriods
+        WorstMs      = $worst
+    }
+}
+
 function Send-AlertEmail {
     # Sends one alert. Returns $true when the mail host accepted it. Failure to send never stops the monitor.
     param([Parameter(Mandatory)][string]$Subject, [Parameter(Mandatory)][string]$Body)
@@ -1726,7 +1944,7 @@ function Send-AlertOrQueue {
     # Sends now. When the mail path is down the message is queued and retried once a minute for up to an hour.
     # A newer message about the same outage makes older undelivered ones stale, so they are dropped.
     param([Parameter(Mandatory)][string]$Subject, [Parameter(Mandatory)][string]$Body, [Parameter(Mandatory)][string]$Kind)
-    $stale = switch ($Kind) { 'Resolved' { @('Down','Reminder') } 'Reminder' { @('Down','Reminder') } 'Restart' { @('Restart') } default { @() } }
+    $stale = switch ($Kind) { 'Resolved' { @('Down','Reminder') } 'Reminder' { @('Down','Reminder') } 'Down' { @('Slow','SlowReminder') } 'SlowResolved' { @('Slow','SlowReminder') } 'SlowReminder' { @('Slow','SlowReminder') } 'Restart' { @('Restart') } 'Summary' { @('Summary') } default { @() } }
     foreach ($old in @($script:PendingAlerts | Where-Object { $_.Kind -in $stale })) {
         Write-Log -Level WARNING -Message "Dropping undelivered '$($old.Subject)', superseded by '$Subject'."
         Write-DropLog -Kind 'ALERT' -Message "Dropped undelivered '$($old.Subject)', superseded by '$Subject'."
@@ -1793,7 +2011,7 @@ function Write-DropLog {
 
 function Write-Heartbeat {
     # Records that the monitor is alive plus the outage state, so a restart can measure its gap and carry an outage over
-    param([Parameter(Mandatory)][hashtable]$State, [Parameter(Mandatory)][datetime]$NowUtc)
+    param([Parameter(Mandatory)][hashtable]$State, [Parameter(Mandatory)][datetime]$NowUtc, [hashtable]$SlowState)
     $iso = { param($d) if ($null -eq $d) { $null } else { ([datetime]$d).ToUniversalTime().ToString('o') } }
     $doc = [ordered]@{
         Beat                = $NowUtc.ToUniversalTime().ToString('o')
@@ -1804,13 +2022,27 @@ function Write-Heartbeat {
         OutageStartUtcStr   = $State.OutageStartUtcStr
         LastAlertUtc        = (& $iso $State.LastAlertUtc)
         AlertDelivered      = $State.AlertDelivered
+        IsSlow              = [bool]$SlowState.IsSlow
+        SlowStartUtc        = (& $iso $SlowState.StartUtc)
+        SlowStartLocalStr   = $SlowState.StartLocalStr
+        SlowLastAlertUtc    = (& $iso $SlowState.LastAlertUtc)
+        SlowPolls           = [int]$SlowState.Polls
+        SlowSlowPolls       = [int]$SlowState.SlowPolls
+        SlowFailedPolls     = [int]$SlowState.FailedPolls
+        SlowWorstMs         = [int]$SlowState.WorstMs
+        SlowAlertDelivered  = $SlowState.AlertDelivered
         Stopped             = $false
     }
     try {
         # Written to a temp file and renamed into place, so a crash or kill mid-write can never leave a truncated heartbeat
         $tmp = "$HeartbeatFile.tmp"
         $doc | ConvertTo-Json -Compress | Set-Content -Path $tmp -Encoding UTF8 -Force
-        Move-Item -Path $tmp -Destination $HeartbeatFile -Force -ErrorAction Stop
+        # A reader holding the file open can block the replace for a moment, so try again before giving up
+        $moved = $false
+        for ($attempt = 1; -not $moved; $attempt++) {
+            try { Move-Item -Path $tmp -Destination $HeartbeatFile -Force -ErrorAction Stop; $moved = $true }
+            catch { if ($attempt -ge 3) { throw }; Start-Sleep -Milliseconds 200 }
+        }
         $script:HeartbeatWarned = $false
     }
     catch {
@@ -1843,6 +2075,15 @@ function Read-Heartbeat {
             OutageStartUtcStr   = [string]$j.OutageStartUtcStr
             LastAlertUtc        = (& $parse $j.LastAlertUtc)
             AlertDelivered      = $j.AlertDelivered
+            IsSlow              = [bool]$j.IsSlow
+            SlowStartUtc        = (& $parse $j.SlowStartUtc)
+            SlowStartLocalStr   = [string]$j.SlowStartLocalStr
+            SlowLastAlertUtc    = (& $parse $j.SlowLastAlertUtc)
+            SlowPolls           = [int]$j.SlowPolls
+            SlowSlowPolls       = [int]$j.SlowSlowPolls
+            SlowFailedPolls     = [int]$j.SlowFailedPolls
+            SlowWorstMs         = [int]$j.SlowWorstMs
+            SlowAlertDelivered  = $j.SlowAlertDelivered
             Stopped             = [bool]$j.Stopped
         }
     }
@@ -1885,6 +2126,7 @@ function Get-RestartNotice {
         'Outage in progress' = $outage
         'Endpoint'           = $Url
     }
+    if ($Previous.IsSlow) { $details['Slow period in progress'] = "Yes, since $($Previous.SlowStartLocalStr) local. Slow tracking starts fresh." }
     [PSCustomObject]@{
         Subject       = "[HST MONITOR RESTARTED] $SiteName ($HostName) - not running for $gapText"
         Body          = (New-AlertBody -Heading "HST eChart monitor restarted on $SiteName" -Details $details)
@@ -1948,8 +2190,9 @@ $bootUtc = [datetime]::MinValue
 try { $bootUtc = ([datetime](Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime).ToUniversalTime() }
 catch { Write-Log -Level WARNING -Message "Could not read the server boot time. $($_.Exception.Message)" }
 $startUtc = (Get-Date).ToUniversalTime()
-$notice = Get-RestartNotice -Previous (Read-Heartbeat) -NowUtc $startUtc -BootTimeUtc $bootUtc -GapThresholdSeconds ([math]::Max(60, 2 * ($IntervalSeconds + $TimeoutSeconds))) -IntervalSeconds $IntervalSeconds -SiteName $SiteName -HostName $env:COMPUTERNAME -Url $Url
-Write-DropLog -Kind 'START' -Message "Monitor started on $env:COMPUTERNAME for site '$SiteName' (poll every $IntervalSeconds s, timeout $TimeoutSeconds s, down after $DownThreshold failures)."
+$previous = Read-Heartbeat
+$notice = Get-RestartNotice -Previous $previous -NowUtc $startUtc -BootTimeUtc $bootUtc -GapThresholdSeconds ([math]::Max(60, 2 * ($IntervalSeconds + $TimeoutSeconds))) -IntervalSeconds $IntervalSeconds -SiteName $SiteName -HostName $env:COMPUTERNAME -Url $Url
+Write-DropLog -Kind 'START' -Message "Monitor started on $env:COMPUTERNAME for site '$SiteName' (poll every $IntervalSeconds s, timeout $TimeoutSeconds s, down after $DownThreshold failures, slow at $SlowAlertPercent% of polls over $SlowThresholdMs ms or failed in $SlowWindowMinutes min)."
 if ($notice) {
     if ($notice.Subject) {
         Write-Log -Level WARNING -Message "The monitor was not running for $(Format-Duration ([TimeSpan]::FromSeconds($notice.GapSeconds))). Sending a restart notice."
@@ -1963,7 +2206,36 @@ if ($notice) {
         Write-DropLog -Kind 'CARRYOVER' -Message "Outage in progress since $($state.OutageStartLocalStr) local carried over from before the restart ($($state.ConsecutiveFailures) failed polls so far)."
     }
 }
-Write-Heartbeat -State $state -NowUtc $startUtc
+$slowState = @{ Samples = @(); IsSlow = $false; StartUtc = $null; StartLocalStr = $null; LastAlertUtc = $null; Polls = 0; SlowPolls = 0; FailedPolls = 0; WorstMs = 0; AlertDelivered = $null }
+if ($previous -and $previous.IsSlow -and $null -ne $previous.SlowStartUtc -and -not $state.IsDown) {
+    # Only a short gap keeps the period: after a long one nobody watched the gap, and the restart notice says so
+    if ($notice -and $notice.GapSeconds -le ($SlowWindowMinutes * 60)) {
+        $slowState.IsSlow = $true
+        $slowState.StartUtc = $previous.SlowStartUtc
+        $slowState.StartLocalStr = $previous.SlowStartLocalStr
+        $slowState.LastAlertUtc = $previous.SlowLastAlertUtc
+        $slowState.Polls = $previous.SlowPolls
+        $slowState.SlowPolls = $previous.SlowSlowPolls
+        $slowState.FailedPolls = $previous.SlowFailedPolls
+        $slowState.WorstMs = $previous.SlowWorstMs
+        $slowState.AlertDelivered = [bool]$previous.SlowAlertDelivered
+        Write-Log -Level WARNING -Message "A slow period was in progress at the last heartbeat (since $($slowState.StartLocalStr) local). Tracking continues from that start."
+        Write-DropLog -Kind 'CARRYOVER' -Message "Slow period since $($slowState.StartLocalStr) local carried over from before the restart."
+    }
+    else {
+        $gapText = Format-Duration ([TimeSpan]::FromSeconds([int]$notice.GapSeconds))
+        Write-Log -Level WARNING -Message "A slow period since $($previous.SlowStartLocalStr) local was not carried over because the monitor was not running for $gapText. Slow tracking starts fresh."
+        Write-DropLog -Kind 'SLOWCLEAR' -Message "Slow period since $($previous.SlowStartLocalStr) local not carried over: the monitor was not running for $gapText. Slow tracking starts fresh."
+    }
+}
+$summarySent = ''
+try { if (Test-Path $SummaryStateFile) { $summarySent = "$(Get-Content -Path $SummaryStateFile -TotalCount 1 -ErrorAction Stop)".Trim() } } catch { }
+if (-not $summarySent -and $DailySummaryHour -ge 0 -and (Get-Date).Hour -ge $DailySummaryHour) {
+    # A first start after today's summary hour waits for tomorrow instead of summarising a day it did not watch
+    $summarySent = (Get-Date).ToString('yyyy-MM-dd')
+    try { Set-Content -Path $SummaryStateFile -Value $summarySent -Encoding ASCII -ErrorAction Stop } catch { }
+}
+Write-Heartbeat -State $state -NowUtc $startUtc -SlowState $slowState
 Wait-NetworkReady -Url $Url | Out-Null
 if ($notice -and $notice.Subject) { Send-AlertOrQueue -Subject $notice.Subject -Body $notice.Body -Kind 'Restart' | Out-Null }
 
@@ -1977,7 +2249,7 @@ try {
                 if ($w) { Write-Log -Level WARNING -Message $w }
             }
 
-            Write-Heartbeat -State $state -NowUtc ((Get-Date).ToUniversalTime())
+            Write-Heartbeat -State $state -NowUtc ((Get-Date).ToUniversalTime()) -SlowState $slowState
             $result = Get-HSTProbeResult
 
             # A non-zero curl exit means the transfer did not complete, even when a 200 status had already arrived
@@ -2000,10 +2272,34 @@ try {
                 $ok = Send-AlertOrQueue -Subject $decision.EmailSubject -Body $decision.EmailBody -Kind $decision.EmailKind
                 if ($ok -and $decision.EmailKind -in @('Down','Reminder')) { $state.AlertDelivered = $true }
             }
+
+            $slow = Update-SlowState -State $slowState -Result $result -Failed $failed -IsDown $state.IsDown -NowUtc ((Get-Date).ToUniversalTime()) -SlowThresholdMs $SlowThresholdMs -WindowMinutes $SlowWindowMinutes -AlertPercent $SlowAlertPercent -ClearPercent $SlowClearPercent -ReAlertMinutes $ReAlertMinutes -AlertOnRecovery $AlertOnRecovery -SiteName $SiteName -Url $Url -HostName $env:COMPUTERNAME
+            $slowState = $slow.State
+            if ($slow.TransitionLog) { Write-Log -Level ADDED -Message $slow.TransitionLog; Write-DropLog -Kind $slow.DropKind -Message $slow.TransitionLog }
+            if ($AlertOnSlow -and $slow.EmailSubject) {
+                $okSlow = Send-AlertOrQueue -Subject $slow.EmailSubject -Body $slow.EmailBody -Kind $slow.EmailKind
+                if ($okSlow -and $slow.EmailKind -in @('Slow','SlowReminder')) { $slowState.AlertDelivered = $true }
+            }
+
+            if (Test-DailySummaryDue -NowLocal (Get-Date) -Hour $DailySummaryHour -LastSentDate $summarySent) {
+                $summarySent = (Get-Date).ToString('yyyy-MM-dd')
+                try { Set-Content -Path $SummaryStateFile -Value $summarySent -Encoding ASCII -ErrorAction Stop }
+                catch { Write-Log -Level WARNING -Message "Could not record the daily summary date in '$SummaryStateFile'. $($_.Exception.Message)" }
+                $dropLines = @()
+                try { if (Test-Path $DropLog) { $dropLines = @(Get-Content -Path $DropLog -ErrorAction Stop) } } catch { Write-Log -Level WARNING -Message "Could not read the drops log for the daily summary. $($_.Exception.Message)" }
+                $summary = Get-DailySummary -Lines $dropLines -NowLocal (Get-Date) -SlowThresholdMs $SlowThresholdMs -SiteName $SiteName -HostName $env:COMPUTERNAME -Url $Url
+                if ($summary) {
+                    Write-Log -Level INFORMATIONAL -Message "Daily summary: $($summary.Subject)"
+                    Send-AlertOrQueue -Subject $summary.Subject -Body $summary.Body -Kind 'Summary' | Out-Null
+                }
+                else { Write-Log -Level INFORMATIONAL -Message "Daily summary: no slow or failed polls, outages, or restarts in the last 24 hours. No email." }
+            }
+
             $deliveredKinds = @(Send-PendingAlert)
             if ($state.IsDown -and (@($deliveredKinds | Where-Object { $_ -in @('Down','Reminder') }).Count -gt 0)) { $state.AlertDelivered = $true }
+            if ($slowState.IsSlow -and (@($deliveredKinds | Where-Object { $_ -in @('Slow','SlowReminder') }).Count -gt 0)) { $slowState.AlertDelivered = $true }
             Write-CsvRow -Path (Get-LatencyCsvPath) -Row $result
-            Write-Heartbeat -State $state -NowUtc ((Get-Date).ToUniversalTime())
+            Write-Heartbeat -State $state -NowUtc ((Get-Date).ToUniversalTime()) -SlowState $slowState
         }
         catch {
             Write-Log -Level ERROR -Message "Probe cycle error: $($_.Exception.Message)"
@@ -2227,7 +2523,7 @@ if ($SendInstallTestEmail) {
         if ($plain) { $cred = New-Object System.Management.Automation.PSCredential($mail.SmtpAuthUser, (ConvertTo-SecureText -Text $plain)) }
         else { $canSend = $false; Write-Log -Level WARNING -Message "Could not read back the stored SMTP password. Skipping the install confirmation email." }
     }
-    $body = New-AlertBody -Heading "HST eChart monitor installed" -Details ([ordered]@{ 'Site' = $site; 'Server' = $env:COMPUTERNAME; 'Endpoint' = $Url; 'Task' = "$TaskPath$TaskName ($taskState)"; 'Preflight' = "HTTP $($reach.HttpCode) after $($reach.Redirects) redirect(s)"; 'Alerts via' = "$($mail.MailMethod) from $($mail.MailFrom)"; 'Installed' = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') }) -Footer "Sent by the HST eChart monitor installer on $env:COMPUTERNAME."
+    $body = New-AlertBody -Heading "HST eChart monitor installed" -Details ([ordered]@{ 'Site' = $site; 'Server' = $env:COMPUTERNAME; 'Endpoint' = $Url; 'Task' = "$TaskPath$TaskName ($taskState)"; 'Preflight' = "HTTP $($reach.HttpCode) after $($reach.Redirects) redirect(s)"; 'Alerts via' = "$($mail.MailMethod) from $($mail.MailFrom)"; 'Down alert' = "After $DownThreshold failed polls in a row"; 'Slow alert' = $(if ($AlertOnSlow) { "When $SlowAlertPercent% of polls in $SlowWindowMinutes min are slower than $SlowThresholdMs ms or fail" } else { 'Off' }); 'Daily summary' = $(if ($DailySummaryHour -ge 0) { "At $('{0:00}' -f $DailySummaryHour):00 when anything was slow or failed" } else { 'Off' }); 'Installed' = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') }) -Footer "Sent by the HST eChart monitor installer on $env:COMPUTERNAME."
     if ($script:MailTestSkipped) { Write-Log -Level WARNING -Message "Install confirmation email skipped: the test email failed and was skipped. The monitor sends alerts on its own once the mail path works." }
     elseif ($canSend -and (Send-MailWithConfig -Mail $mail -Subject "[HST MONITOR INSTALLED] $site ($env:COMPUTERNAME)" -Body $body -Credential $cred -GraphSecret $graphSecret -MaxWaitSeconds 120)) {
         Write-Log -Level INFORMATIONAL -Message "Install confirmation email sent."
@@ -2243,6 +2539,9 @@ Write-Host "  Task            : $TaskPath$TaskName ($taskState, runs as $RunAsUs
 Write-Host "  Monitor         : $monitorPath"
 Write-Host "  Data folder     : $InstallDir  (latency CSV monthly, HST-eChart-Outages.csv, HST-eChart-Drops.log, daily logs)"
 Write-Host "  Alerts          : $($mail.MailMethod) from $($mail.MailFrom) to $($mail.MailTo -join ', ')"
+Write-Host "  Down alert      : after $DownThreshold failed polls in a row"
+Write-Host "  Slow alert      : $(if ($AlertOnSlow) { "when $SlowAlertPercent% of polls in $SlowWindowMinutes min are slower than $SlowThresholdMs ms or fail" } else { 'off (slow periods are still logged)' })"
+Write-Host "  Daily summary   : $(if ($DailySummaryHour -ge 0) { "at $('{0:00}' -f $DailySummaryHour):00 when anything was slow or failed" } else { 'off' })"
 if ($mail.MailMethod -eq 'Graph') {
     Write-Host "  Tenant ID       : $($mail.GraphTenantId)"
     Write-Host "  Client ID       : $($mail.GraphClientId)"

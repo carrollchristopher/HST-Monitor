@@ -39,11 +39,19 @@ Check "K1 ConvertTo-SecureText round-trips unicode and surrogate pairs through P
 Check "K1 Protect-Secret rejects an empty text secret" ((& { try { Protect-Secret -PlainText '' ; $false } catch { $true } }))
 $InstallDir = $scratch
 $credPath = Join-Path $scratch $CredentialFileName
-# Not elevated here: the file must be locked to SYSTEM and Administrators before any content lands in it, so this
-# caller is refused at the write and the file stays empty. The elevated end-to-end test covers the successful path.
+# The file is locked to SYSTEM and Administrators before any content lands in it. Not elevated, this caller is refused
+# at the write and the file stays empty. Elevated, the write succeeds and only those two principals have access.
 $saveThrew = $false
 try { Save-SmtpCredential -CipherText $cipher } catch { $saveThrew = $true }
-Check "K1 credential file created and locked before content (non-admin write refused, file empty)" ($saveThrew -and (Test-Path $credPath) -and ((Get-Item $credPath).Length -eq 0))
+$elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if ($elevated) {
+    $credAcl = Get-Acl $credPath
+    $credSids = @($credAcl.Access | ForEach-Object { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } | Sort-Object -Unique)
+    Check "K1 credential file locked to SYSTEM and Administrators, inheritance removed, content written (elevated)" (-not $saveThrew -and (Get-Item $credPath).Length -gt 0 -and $credAcl.AreAccessRulesProtected -and (($credSids -join ',') -eq 'S-1-5-18,S-1-5-32-544'))
+}
+else {
+    Check "K1 credential file created and locked before content (non-admin write refused, file empty)" ($saveThrew -and (Test-Path $credPath) -and ((Get-Item $credPath).Length -eq 0))
+}
 $acl = & icacls.exe $credPath
 $aclText = ($acl | Out-String)
 Check "K1 ACL grants SYSTEM full" ($aclText -match [regex]::Escape('NT AUTHORITY\SYSTEM:(F)'))
@@ -367,6 +375,66 @@ if ($logLock) {
     Check "M5 skipped polls logged as warnings, no cycle errors" ($lockText -match 'Could not append to' -and -not ($lockText -match 'Probe cycle error'))
 }
 Check "M5 locked CSV not moved aside" (@(Get-ChildItem $runDir5 -Filter 'HST-eChart-Latency_*_schema-*.csv').Count -eq 0)
+
+# M9: sustained slow responses raise SLOW, recovery raises SLOW RESOLVED, and a due daily summary goes out on the first poll
+$runDir9 = Join-Path $scratch 'run_slow'
+New-Item $runDir9 -ItemType Directory | Out-Null
+$InstallDir = $runDir9
+$port9 = Get-FreeTestPort
+$slowFlag = Join-Path $runDir9 'slow.flag'
+$Url = "http://127.0.0.1:$port9/"
+$saved9 = @($SlowThresholdMs, $SlowWindowMinutes, $SlowAlertPercent, $SlowClearPercent, $AlertOnSlow, $DailySummaryHour)
+$IntervalSeconds = 1; $TimeoutSeconds = 5; $DownThreshold = 3; $MinPopulatedBytes = 100; $ExpectedContentMarker = ''
+$SlowThresholdMs = 1000; $SlowWindowMinutes = 1; $SlowAlertPercent = 50; $SlowClearPercent = 10; $AlertOnSlow = $true; $DailySummaryHour = (Get-Date).Hour
+$genSlow9 = New-MonitorContent -SiteName 'WinSlow' -Mail $mailDown
+$SlowThresholdMs, $SlowWindowMinutes, $SlowAlertPercent, $SlowClearPercent, $AlertOnSlow, $DailySummaryHour = $saved9
+$monSlow9 = Join-Path $runDir9 'monitor.ps1'
+Set-Content $monSlow9 -Value $genSlow9 -Encoding UTF8
+Set-Content (Join-Path $runDir9 'HST-eChart-Drops.log') -Value ("{0} | {1,-9} | {2}" -f (Get-Date).AddHours(-1).ToString('yyyy-MM-dd HH:mm:ss'), 'FAIL', 'Site=WinSlow Code=000 Redirects=0 TTFB=5000ms Total=5000ms Populated=False IP= Reason=Timed out') -Encoding UTF8
+Set-Content (Join-Path $runDir9 'daily-summary-sent.txt') -Value (Get-Date).AddDays(-1).ToString('yyyy-MM-dd') -Encoding ASCII
+$srv9 = Start-Job -ScriptBlock {
+    param($port, $flag)
+    $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $port)
+    $listener.Start()
+    $deadline = (Get-Date).AddSeconds(240)
+    $body = ('HST eChart OK ' * 20)
+    while ((Get-Date) -lt $deadline) {
+        if ($listener.Pending()) {
+            $client = $listener.AcceptTcpClient()
+            $stream = $client.GetStream()
+            $stream.ReadTimeout = 300
+            $buf = New-Object byte[] 4096
+            try { $stream.Read($buf, 0, $buf.Length) | Out-Null } catch { }
+            if (Test-Path $flag) { Start-Sleep -Milliseconds 1500 }
+            $resp = "HTTP/1.1 200 OK`r`nContent-Type: text/html`r`nContent-Length: $($body.Length)`r`nConnection: close`r`n`r`n$body"
+            $bytes = [System.Text.Encoding]::ASCII.GetBytes($resp)
+            try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush() } catch { }
+            $client.Close()
+        } else { Start-Sleep -Milliseconds 30 }
+    }
+    $listener.Stop()
+} -ArgumentList $port9, $slowFlag
+Start-Sleep -Seconds 2
+$p9 = Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$monSlow9`"" -WindowStyle Hidden -PassThru
+Start-Sleep -Seconds 20
+Set-Content -Path $slowFlag -Value 'x'
+Start-Sleep -Seconds 75
+Remove-Item $slowFlag -Force
+Start-Sleep -Seconds 95
+Stop-Process -Id $p9.Id -Force -ErrorAction SilentlyContinue
+$srv9 | Stop-Job -ErrorAction SilentlyContinue; $srv9 | Remove-Job -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 2
+$drop9 = @(Get-Content (Join-Path $runDir9 'HST-eChart-Drops.log') -ErrorAction SilentlyContinue)
+$drop9Text = $drop9 -join "`n"
+$log9 = (Get-ChildItem $runDir9 -Filter 'HST-eChart-Monitor_*.log' | Select-Object -First 1 | Get-Content -Raw)
+Check "M9 START line states the slow alert rule" ($drop9Text -match '\| START +\| Monitor started on .* slow at 50% of polls over 1000 ms or failed in 1 min\)\.')
+Check "M9 slow responses logged as SLOW lines, no failures, no outage" (@($drop9 | Where-Object { $_ -match '\| SLOW +\| Site=WinSlow Code=200' }).Count -ge 10 -and -not ($drop9Text -match '\| DOWN +\|') -and @($drop9 | Where-Object { $_ -match '\| FAIL +\|' }).Count -eq 1)
+Check "M9 SLOW declared once while the endpoint was slow" (@($drop9 | Where-Object { $_ -match '\| SLOWSTART \| Declared SLOW for WinSlow: \d+ polls in 1 min: \d+ slower than 1000 ms, 0 failed \(median \d+ ms, worst \d+ ms\)\.' }).Count -eq 1)
+Check "M9 slow period closed after recovery with its totals" (@($drop9 | Where-Object { $_ -match '\| SLOWCLEAR \| Slow period over for WinSlow: lasted \d+m \d+s, \d+ polls, \d+ slow, 0 failed, worst \d+ ms\.' }).Count -eq 1)
+Check "M9 SLOW and SLOW RESOLVED emails attempted in order" ($drop9Text -match '(?s)\| ALERT +\| Not sent, retrying every minute for up to 60 minutes: \[HST SLOW\] WinSlow \([^)]+\) - \d+ of \d+ polls slow or failed in 1 min.*\| SLOWCLEAR .*\[HST SLOW RESOLVED\] WinSlow \([^)]+\) - slow period lasted ')
+Check "M9 heartbeat ends not slow" (-not (Get-Content (Join-Path $runDir9 'monitor-heartbeat.json') -Raw | ConvertFrom-Json).IsSlow)
+Check "M9 due daily summary built from the drops log and sent on the first poll" ($log9 -match 'Daily summary: \[HST DAILY\] WinSlow \([^)]+\) - 0 slow polls, 1 failed poll, 0 outages in 24 hours' -and $drop9Text -match '\| ALERT +\| Not sent, retrying every minute for up to 60 minutes: \[HST DAILY\] WinSlow')
+Check "M9 summary date recorded, so it is not sent twice" ((Get-Content (Join-Path $runDir9 'daily-summary-sent.txt') -TotalCount 1) -eq (Get-Date).ToString('yyyy-MM-dd') -and @([regex]::Matches($log9, 'Daily summary: ')).Count -eq 1)
 
 # M3: no plaintext secret anywhere in any artifact
 $leak = Get-ChildItem $scratch -Recurse -File | Where-Object { (Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue) -like "*s3cret-O'Brien*" }

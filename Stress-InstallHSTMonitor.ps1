@@ -50,7 +50,7 @@ Check "All Write-Log levels approved" ($badLevels.Count -eq 0)
 $subjects = [regex]::Matches($src,'"\[HST [A-Z ]+\][^"]*"') | % { $_.Value }
 Check "Found subject literals ($($subjects.Count))" ($subjects.Count -ge 5)
 $subjectTypes = $subjects | % { ([regex]::Match($_,'\[HST ([A-Z ]+)\]')).Groups[1].Value } | Sort-Object -Unique
-Check "Subject set is exactly DOWN/STILL DOWN/RESOLVED/MONITOR TEST/MONITOR INSTALLED/MONITOR RESTARTED" ((($subjectTypes -join '|')) -eq 'DOWN|MONITOR INSTALLED|MONITOR RESTARTED|MONITOR TEST|RESOLVED|STILL DOWN')
+Check "Subject set is exactly DAILY/DOWN/MONITOR INSTALLED/MONITOR RESTARTED/MONITOR TEST/RESOLVED/SLOW/SLOW RESOLVED/STILL DOWN/STILL SLOW" ((($subjectTypes -join '|')) -eq 'DAILY|DOWN|MONITOR INSTALLED|MONITOR RESTARTED|MONITOR TEST|RESOLVED|SLOW|SLOW RESOLVED|STILL DOWN|STILL SLOW')
 Check "Every subject carries the site name variable" (($subjects | Where-Object { $_ -notmatch '\$SiteName|\$site' }).Count -eq 0)
 
 Check "Single deliverable: only Install-HSTMonitor.ps1 among installer files" ((Get-ChildItem /mnt/user-data/outputs -Filter '*HSTMonitor*.ps1').Count -eq 1)
@@ -206,7 +206,7 @@ $NonInteractive=$false
 Section "D. Monitor functions: extract from generated monitor"
 $gT=$null;$gE=$null
 $gAst=[System.Management.Automation.Language.Parser]::ParseInput($gen,[ref]$gT,[ref]$gE)
-foreach ($f in $gAst.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in @('ConvertTo-Ms','Format-Duration','Get-CurlReason','Get-LatencyCsvPath','Write-CsvRow','Get-TranscriptPath','Update-MonitorState','Get-HSTProbeResult','Get-SecretExpiryWarning','New-AlertBody','Write-Heartbeat','Read-Heartbeat','Get-RestartNotice','Send-AlertOrQueue','Send-PendingAlert','Wait-NetworkReady','Get-SmtpCredential','ConvertTo-SecureText','Write-DropLog')},$true)) { Invoke-Expression $f.Extent.Text }
+foreach ($f in $gAst.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in @('ConvertTo-Ms','Format-Duration','Get-CurlReason','Get-LatencyCsvPath','Write-CsvRow','Get-TranscriptPath','Update-MonitorState','Get-HSTProbeResult','Get-SecretExpiryWarning','New-AlertBody','Write-Heartbeat','Read-Heartbeat','Get-RestartNotice','Send-AlertOrQueue','Send-PendingAlert','Wait-NetworkReady','Get-SmtpCredential','ConvertTo-SecureText','Write-DropLog','Update-SlowState','Test-DailySummaryDue','Get-DailySummary')},$true)) { Invoke-Expression $f.Extent.Text }
 $InstallDir = '/tmp/hstprobe_test'; if (Test-Path $InstallDir){Remove-Item $InstallDir -Recurse -Force}; New-Item $InstallDir -ItemType Directory | Out-Null
 
 Check "Ms: 0.123456 -> 123" ((ConvertTo-Ms '0.123456') -eq 123)
@@ -483,6 +483,154 @@ Check "Probe cycle errors reach the drops log" ($template.Contains("Write-DropLo
 Check "Install email skipped when the SMTP password cannot be read back" ($src -match '\$canSend -and \(Send-MailWithConfig')
 Check "Stored secret gated on the credential recorded at the last successful install" ($src -match "\`$Saved\.CredentialFor -eq \`$client\) \{ Get-StoredSecret \}" -and $src -match "\`$settings\['CredentialFor'\] = switch")
 function Write-Log { param($Level,$Message) }
+
+Section "E3. Slow periods and daily summary"
+function SlowRes($ms, $local = 'L', $code = '200', $reason = 'OK') { [PSCustomObject]@{ Timestamp_Local = $local; Timestamp_UTC = 'U'; HttpCode = $code; ContentOk = ($code -eq '200'); RemoteIp = '1.2.3.4'; Reason = $reason; TotalMs = $ms } }
+function NewSlow { @{ Samples = @(); IsSlow = $false; StartUtc = $null; StartLocalStr = $null; LastAlertUtc = $null; Polls = 0; SlowPolls = 0; FailedPolls = 0; WorstMs = 0; AlertDelivered = $null } }
+function Pl($ms, $f = $false, $down = $false) { [PSCustomObject]@{ Ms = $ms; F = $f; D = $down } }
+function RunSlow {
+    param([hashtable]$State, [object[]]$Polls, [datetime]$Start, [int]$Spacing = 15, [int]$Re = 30, [bool]$Aor = $true)
+    $steps = New-Object System.Collections.ArrayList; $st = $State; $i = 0
+    foreach ($q in $Polls) {
+        $now = $Start.AddSeconds($i * $Spacing)
+        $res = if ($q.F) { SlowRes $null ("P{0:000}" -f $i) '000' 'Timed out' } else { SlowRes $q.Ms ("P{0:000}" -f $i) }
+        $d = Update-SlowState -State $st -Result $res -Failed ([bool]$q.F) -IsDown ([bool]$q.D) -NowUtc $now -SlowThresholdMs 3000 -WindowMinutes 5 -AlertPercent 50 -ClearPercent 10 -ReAlertMinutes $Re -AlertOnRecovery $Aor -SiteName 'CapCity' -Url 'http://x' -HostName 'HOST1'
+        $st = $d.State
+        [void]$steps.Add([PSCustomObject]@{ I = $i; Now = $now; D = $d })
+        $i++
+    }
+    [PSCustomObject]@{ State = $st; Steps = $steps; Emails = @($steps | Where-Object { $_.D.EmailSubject }) }
+}
+function Rep($poll, [int]$n) { @(1..$n | ForEach-Object { $poll }) }
+
+$r = RunSlow -State (NewSlow) -Polls (Rep (Pl 300) 40) -Start $T0
+Check "SL1 steady fast polls: no email, not slow, window holds at most 5 min of polls" ($r.Emails.Count -eq 0 -and -not $r.State.IsSlow -and $r.State.Samples.Count -eq 20)
+
+$blips = @(); for ($i = 0; $i -lt 40; $i++) { $blips += $(if ($i % 10 -eq 5) { Pl 4500 } elseif ($i -eq 22) { Pl $null $true } else { Pl 300 }) }
+$r = RunSlow -State (NewSlow) -Polls $blips -Start $T0
+Check "SL2 isolated slow polls and one timeout: no email" ($r.Emails.Count -eq 0 -and -not $r.State.IsSlow)
+
+$seq = @(Rep (Pl 300) 20) + @(Rep (Pl 4500) 140) + @(Rep (Pl 300) 25)
+$seq[100] = Pl 9001
+$r = RunSlow -State (NewSlow) -Polls $seq -Start $T0
+$kinds = @($r.Emails | ForEach-Object { "$($_.I):$($_.D.EmailKind)" })
+Check "SL3 sustained slowness: exactly SLOW, STILL SLOW, SLOW RESOLVED in that order" (($kinds -join ',') -eq '29:Slow,149:SlowReminder,177:SlowResolved')
+$e = $r.Steps[29].D
+Check "SL3 SLOW when half the 5 min window is slow, subject counts polls" ($e.EmailSubject -eq '[HST SLOW] CapCity (HOST1) - 10 of 20 polls slow or failed in 5 min' -and $e.DropKind -eq 'SLOWSTART' -and $e.State.StartLocalStr -eq 'P020' -and $e.State.StartUtc -eq $T0.AddSeconds(300))
+Check "SL3 SLOW body: HTML table with window counts, timing, clear rule, server" ($e.EmailBody -match '^<html>' -and $e.EmailBody -match '<td[^>]*>Last 5 min</td><td[^>]*>20 polls in 5 min: 10 slower than 3000 ms, 0 failed</td>' -and $e.EmailBody -match 'median \d+ ms, worst 4500 ms' -and $e.EmailBody -match '<td[^>]*>Server</td><td[^>]*>HOST1</td>' -and $e.EmailBody -match '10% or fewer')
+Check "SL3 log line for the drops log" ($e.TransitionLog -eq 'Declared SLOW for CapCity: 20 polls in 5 min: 10 slower than 3000 ms, 0 failed (median 300 ms, worst 4500 ms).')
+$e = $r.Steps[149].D
+Check "SL3 STILL SLOW after 30 min with elapsed since the first slow poll" ($e.EmailSubject -eq "[HST STILL SLOW] CapCity (HOST1) - slow for $(Format-Duration ([TimeSpan]::FromSeconds(149 * 15 - 300)))" -and $e.DropKind -eq 'SLOWSTILL')
+Check "SL3 hysteresis: still slow at 40 percent, no email" ($r.Steps[171].D.State.IsSlow -and $null -eq $r.Steps[171].D.EmailSubject)
+$e = $r.Steps[177].D
+Check "SL3 SLOW RESOLVED once the share is 10 percent, timed from the first good poll after the last slow one" ($e.EmailSubject -eq "[HST SLOW RESOLVED] CapCity (HOST1) - slow period lasted $(Format-Duration ([TimeSpan]::FromSeconds(160 * 15 - 300)))" -and $e.DropKind -eq 'SLOWCLEAR' -and $e.EmailBody -match '<td[^>]*>Normal from</td><td[^>]*>P160 local</td>' -and $e.EmailBody -match "<td[^>]*>Duration</td><td[^>]*>$(Format-Duration ([TimeSpan]::FromSeconds(2100)))</td>" -and $e.EmailBody -match '<td[^>]*>Polls while slow</td><td[^>]*>150: 140 slower than 3000 ms, 0 failed</td>' -and $e.EmailBody -match '<td[^>]*>Worst response</td><td[^>]*>9001 ms</td>' -and $e.TransitionLog -match 'lasted 35m 00s, 150 polls, 140 slow, 0 failed, worst 9001 ms\.$')
+Check "SL3 state reset after resolution" (-not $e.State.IsSlow -and $null -eq $e.State.StartUtc -and $e.State.Polls -eq 0 -and $e.State.WorstMs -eq 0)
+Check "SL3 SLOW RESOLVED says whether the SLOW email was delivered" ($e.EmailBody -match '<td[^>]*>SLOW alert</td><td[^>]*>Not delivered')
+
+$mixed = @(Rep (Pl 300) 20); for ($i = 0; $i -lt 30; $i++) { $mixed += $(switch ($i % 3) { 0 { Pl $null $true } 1 { Pl 4000 } 2 { Pl 300 } }) }
+$r = RunSlow -State (NewSlow) -Polls $mixed -Start $T0
+$first = @($r.Emails)[0]
+Check "SL4 timeouts mixed with slow polls count toward SLOW" ($first.D.EmailKind -eq 'Slow' -and $first.D.State.FailedPolls -gt 0 -and $first.D.EmailBody -match '\d+ slower than 3000 ms, [1-9]\d* failed')
+
+$seq = @(Rep (Pl 300) 20) + @(Rep (Pl 4500) 12) + @(Pl 300 $false $true) + @(Rep (Pl 300) 3) + @(Rep (Pl 4500) 3) + @(Rep (Pl 300) 20)
+$r = RunSlow -State (NewSlow) -Polls $seq -Start $T0
+$downStep = $r.Steps[32].D
+Check "SL5 an outage closes the slow period with no email and empties the window" ($r.Steps[29].D.EmailKind -eq 'Slow' -and $null -eq $downStep.EmailSubject -and $downStep.DropKind -eq 'SLOWCLEAR' -and $downStep.TransitionLog -match 'ended in an outage' -and -not $downStep.State.IsSlow -and $downStep.State.Samples.Count -eq 0)
+Check "SL5 slow polls right after the outage do not re-alert before half the window is covered" (@($r.Emails | Where-Object { $_.I -gt 32 }).Count -eq 0)
+
+$seq = @(Rep (Pl 300) 20) + @(Rep (Pl 4500) 20) + @(Rep (Pl 300) 25)
+$r = RunSlow -State (NewSlow) -Polls $seq -Start $T0 -Aor $false
+Check "SL6 recovery alerts off: slow period still closes and is logged, no RESOLVED email" (((@($r.Emails | ForEach-Object { $_.D.EmailKind })) -join ',') -eq 'Slow' -and @($r.Steps | Where-Object { $_.D.DropKind -eq 'SLOWCLEAR' }).Count -eq 1)
+$seq = @(Rep (Pl 300) 20) + @(Rep (Pl 4500) 200)
+$r = RunSlow -State (NewSlow) -Polls $seq -Start $T0 -Re 0
+Check "SL7 reminders off: one SLOW email in 50 minutes of slowness" ($r.Emails.Count -eq 1 -and $r.State.IsSlow)
+
+$orig = NewSlow; $orig.Samples = @([PSCustomObject]@{ Utc = $T0; LocalStr = 'X'; Slow = $true; Failed = $false; Ms = 5000 })
+$null = Update-SlowState -State $orig -Result (SlowRes 4000) -Failed $false -IsDown $false -NowUtc $T0.AddSeconds(15) -SiteName 'CapCity' -HostName 'HOST1' -Url 'http://x'
+Check "SL8 pure: the caller's state and window are not changed" (@($orig.Samples).Count -eq 1 -and -not $orig.IsSlow)
+
+function NewCarried { $c = NewSlow; $c.IsSlow = $true; $c.StartUtc = $T0; $c.StartLocalStr = '2026-09-04 08:00:00'; $c.LastAlertUtc = $T0.AddMinutes(1); $c.Polls = 40; $c.SlowPolls = 30; $c.WorstMs = 7000; $c.AlertDelivered = $true; $c }
+$r = RunSlow -State (NewCarried) -Polls (Rep (Pl 250) 12) -Start $T0.AddMinutes(20)
+$e = @($r.Emails)[0]
+Check "SL9 carried-over slow period waits for half the window, then resolves at the 11th fast poll with its true start" ($r.Emails.Count -eq 1 -and $e.I -eq 10 -and $e.D.EmailKind -eq 'SlowResolved' -and $e.D.EmailSubject -eq '[HST SLOW RESOLVED] CapCity (HOST1) - slow period lasted 20m 00s' -and $e.D.EmailBody -match '<td[^>]*>Slow from</td><td[^>]*>2026-09-04 08:00:00 local</td>' -and $e.D.EmailBody -match '<td[^>]*>Normal from</td><td[^>]*>P000 local</td>' -and $e.D.EmailBody -match '40: 30 slower than 3000 ms' -and $e.D.EmailBody -match '<td[^>]*>SLOW alert</td><td[^>]*>Delivered</td>')
+$stillSlow = @(); for ($i = 0; $i -lt 40; $i++) { $stillSlow += $(if ($i % 3 -eq 0) { Pl 300 } else { Pl 4500 }) }
+$r = RunSlow -State (NewCarried) -Polls $stillSlow -Start $T0.AddMinutes(20)
+Check "SL9 carried-over period that is still slow: no SLOW RESOLVED and no second SLOW over 10 minutes, even with a fast first poll" ($r.Emails.Count -eq 0 -and $r.State.IsSlow -and $r.State.StartUtc -eq $T0)
+$r = RunSlow -State (NewCarried) -Polls (@(Pl 300) + @(Rep (Pl 4500) 5)) -Start $T0.AddHours(3)
+Check "SL9 carried-over period: no STILL SLOW before the window is covered again" ($r.Emails.Count -eq 0)
+$prevSlow = [PSCustomObject]@{ BeatUtc = $T0; IsDown = $false; ConsecutiveFailures = 0; OutageStartUtc = $null; OutageStartLocalStr = ''; OutageStartUtcStr = ''; LastAlertUtc = $null; AlertDelivered = $null; Stopped = $false; IsSlow = $true; SlowStartLocalStr = '2026-09-04 07:55:00' }
+$nSlow = Get-RestartNotice -Previous $prevSlow -NowUtc $T0.AddHours(2) -BootTimeUtc $T0.AddHours(-5) -GapThresholdSeconds 60 -IntervalSeconds 10 -SiteName 'CapCity' -HostName 'HOST1' -Url 'http://x'
+$prevSlow.IsSlow = $false
+$nFast = Get-RestartNotice -Previous $prevSlow -NowUtc $T0.AddHours(2) -BootTimeUtc $T0.AddHours(-5) -GapThresholdSeconds 60 -IntervalSeconds 10 -SiteName 'CapCity' -HostName 'HOST1' -Url 'http://x'
+Check "SL9 restart notice after a long gap names the slow period that was in progress" ($nSlow.Body -match '<td[^>]*>Slow period in progress</td><td[^>]*>Yes, since 2026-09-04 07:55:00 local\. Slow tracking starts fresh\.</td>' -and -not ($nFast.Body -match 'Slow period in progress'))
+Check "SL9 startup keeps a slow period only across a gap no longer than the window, and logs when it does not" ($template -match '(?s)if \(\$previous -and \$previous\.IsSlow -and \$null -ne \$previous\.SlowStartUtc -and -not \$state\.IsDown\) \{\s+# [^\n]*\n\s+if \(\$notice -and \$notice\.GapSeconds -le \(\$SlowWindowMinutes \* 60\)\) \{' -and $template.Contains("Write-DropLog -Kind 'SLOWCLEAR' -Message `"Slow period since `$(`$previous.SlowStartLocalStr) local not carried over"))
+
+$slowHb = NewSlow; $slowHb.IsSlow = $true; $slowHb.StartUtc = $T0; $slowHb.StartLocalStr = '2026-09-04 08:00:00'; $slowHb.LastAlertUtc = $T0.AddMinutes(3); $slowHb.Polls = 25; $slowHb.SlowPolls = 14; $slowHb.FailedPolls = 2; $slowHb.WorstMs = 8123; $slowHb.AlertDelivered = $true
+Write-Heartbeat -State $upState -NowUtc $T0.AddMinutes(10) -SlowState $slowHb
+$hbS = Read-Heartbeat
+Check "SL10 heartbeat roundtrip keeps the slow period" ($hbS.IsSlow -and $hbS.SlowStartUtc -eq $T0 -and $hbS.SlowStartUtc.Kind -eq 'Utc' -and $hbS.SlowStartLocalStr -eq '2026-09-04 08:00:00' -and $hbS.SlowLastAlertUtc -eq $T0.AddMinutes(3) -and $hbS.SlowPolls -eq 25 -and $hbS.SlowSlowPolls -eq 14 -and $hbS.SlowFailedPolls -eq 2 -and $hbS.SlowWorstMs -eq 8123 -and $hbS.SlowAlertDelivered -eq $true -and -not $hbS.IsDown)
+Write-Heartbeat -State $upState -NowUtc $T0.AddMinutes(11)
+Check "SL10 heartbeat without a slow state reads back as not slow" (-not (Read-Heartbeat).IsSlow)
+
+$script:PendingAlerts = New-Object System.Collections.ArrayList; $script:SendOk = $false
+Send-AlertOrQueue -Subject '[HST SLOW] a' -Body 'b' -Kind 'Slow' | Out-Null
+Send-AlertOrQueue -Subject '[HST DAILY] a' -Body 'b' -Kind 'Summary' | Out-Null
+Send-AlertOrQueue -Subject '[HST SLOW RESOLVED] a' -Body 'b' -Kind 'SlowResolved' | Out-Null
+Check "SL11 SLOW RESOLVED supersedes an undelivered SLOW" (@($script:PendingAlerts | Where-Object { $_.Kind -eq 'Slow' }).Count -eq 0 -and @($script:PendingAlerts | Where-Object { $_.Kind -eq 'SlowResolved' }).Count -eq 1)
+Send-AlertOrQueue -Subject '[HST SLOW] b' -Body 'b' -Kind 'Slow' | Out-Null
+Send-AlertOrQueue -Subject '[HST DOWN] b' -Body 'b' -Kind 'Down' | Out-Null
+Send-AlertOrQueue -Subject '[HST DAILY] b' -Body 'b' -Kind 'Summary' | Out-Null
+Check "SL11 DOWN supersedes an undelivered SLOW, a newer summary replaces the older one" (@($script:PendingAlerts | Where-Object { $_.Kind -eq 'Slow' }).Count -eq 0 -and @($script:PendingAlerts | Where-Object { $_.Kind -eq 'Summary' }).Count -eq 1 -and @($script:PendingAlerts | Where-Object { $_.Kind -eq 'Summary' })[0].Subject -eq '[HST DAILY] b')
+$script:PendingAlerts.Clear(); $script:SendOk = $true
+
+$d7 = [datetime]'2026-09-15T07:00:00'
+Check "DS1 summary due at the hour once per day, not before, not twice, never when off" ((Test-DailySummaryDue -NowLocal $d7 -Hour 7 -LastSentDate '2026-09-14') -and -not (Test-DailySummaryDue -NowLocal $d7.AddMinutes(-1) -Hour 7 -LastSentDate '2026-09-14') -and -not (Test-DailySummaryDue -NowLocal $d7.AddHours(5) -Hour 7 -LastSentDate '2026-09-15') -and (Test-DailySummaryDue -NowLocal $d7.AddHours(5) -Hour 7 -LastSentDate '') -and -not (Test-DailySummaryDue -NowLocal $d7 -Hour -1 -LastSentDate ''))
+
+$lines = @(
+    ([char]0xFEFF + '2026-09-14 06:59:59 | FAIL      | Site=CapCity Code=000 Redirects=0 TTFB=15013ms Total=15013ms Populated=False IP= Reason=Timed out'),
+    '2026-09-14 07:00:00 | SLOW      | Site=CapCity Code=200 Redirects=2 TTFB=9900ms Total=9999ms Populated=True IP=1.2.3.4 Reason=OK',
+    '2026-09-14 07:00:01 | START     | Monitor started on HOST1 for site CapCity.',
+    '2026-09-15 06:16:14 | SLOW      | Site=CapCity Code=200 Redirects=2 TTFB=6007ms Total=6048ms Populated=True IP=50.19.13.93 Reason=OK',
+    '2026-09-15 06:16:49 | SLOW      | Site=CapCity Code=200 Redirects=2 TTFB=8891ms Total=9001ms Populated=True IP=98.91.165.173 Reason=OK',
+    '2026-09-15 06:18:49 | SLOW      | Site=CapCity Code=200 Redirects=2 TTFB=4303ms Total=4322ms Populated=True IP=184.73.88.34 Reason=OK',
+    '2026-09-15 06:18:50 | SLOWSTART | Declared SLOW for CapCity: 20 polls in 5 min.',
+    '2026-09-15 06:18:50 | ALERT     | Sent: [HST SLOW] CapCity (HOST1) - 10 of 20 polls slow or failed in 5 min',
+    '2026-09-15 06:53:07 | FAIL      | Site=CapCity Code=000 Redirects=0 TTFB=15013ms Total=15013ms Populated=False IP= Reason=Timed out',
+    '2026-09-15 06:55:00 | FAIL      | Site=CapCity Code=503 Redirects=2 TTFB=40ms Total=41ms Populated=False IP=1.2.3.4 Reason=HTTP 503',
+    '2026-09-15 06:55:10 | DOWN      | Declared DOWN for CapCity after 3 consecutive failures (HTTP 503).',
+    '2026-09-15 06:57:20 | RESOLVED  | Outage record written: CapCity lasted 02m 10s over 13 failed polls. Recovery HTTP 200 from 1.2.3.4.',
+    '2026-09-15 06:58:00 | RESTART   | Monitor was not running for 5m 00s. Server restarted.',
+    'garbage line without a stamp',
+    '2026-09-15 07:00:01 | FAIL      | Site=CapCity Code=000 Reason=Timed out'
+)
+$sum = Get-DailySummary -Lines $lines -NowLocal $d7 -SlowThresholdMs 3000 -SiteName 'CapCity' -HostName 'HOST1' -Url 'http://x'
+Check "DS2 summary counts only the 24 hours before the send, subject reads naturally" ($sum -and $sum.Subject -eq '[HST DAILY] CapCity (HOST1) - 3 slow polls, 2 failed polls, 1 outage in 24 hours' -and $sum.SlowPolls -eq 3 -and $sum.FailedPolls -eq 2 -and $sum.Outages -eq 1 -and $sum.SlowPeriods -eq 1 -and $sum.WorstMs -eq 9001)
+Check "DS2 summary body: worst response, failure reasons, outage length, busiest hour, restarts" ($sum.Body -match '<td[^>]*>Slow polls</td><td[^>]*>3 slower than 3000 ms, worst 9001 ms</td>' -and $sum.Body -match '<td[^>]*>Failed polls</td><td[^>]*>2 \((Timed out x1, HTTP 503 x1|HTTP 503 x1, Timed out x1)\)</td>' -and $sum.Body -match '<td[^>]*>Outages</td><td[^>]*>1, lasting 02m 10s</td>' -and $sum.Body -match '<td[^>]*>Busiest hour</td><td[^>]*>06:00 to 06:59, 5 slow or failed polls</td>' -and $sum.Body -match '<td[^>]*>Monitor restarts</td><td[^>]*>1</td>' -and $sum.Body -match '<td[^>]*>Server</td><td[^>]*>HOST1</td>')
+Check "DS3 nothing went wrong: no summary" ($null -eq (Get-DailySummary -Lines @('2026-09-15 06:00:00 | START     | x', '2026-09-15 06:30:00 | ALERT     | Sent: y', '2026-09-15 06:40:00 | STOP      | z') -NowLocal $d7 -SiteName 'CapCity' -HostName 'HOST1') -and $null -eq (Get-DailySummary -Lines @() -NowLocal $d7 -SiteName 'CapCity' -HostName 'HOST1'))
+$ongoing = Get-DailySummary -Lines @('2026-09-14 06:00:00 | DOWN      | Declared DOWN for CapCity after 3 consecutive failures (Timed out).', '2026-09-15 06:30:00 | REMINDER  | Reminder raised for CapCity, down for 24h 30m.', '2026-09-15 06:40:00 | FAIL      | Site=CapCity Code=000 Reason=Timed out') -NowLocal $d7 -SiteName 'CapCity' -HostName 'HOST1'
+Check "DS5 an outage that began before the window and is still going counts once, marked in progress" ($ongoing.Outages -eq 1 -and $ongoing.Subject -match '1 outage in 24 hours$' -and $ongoing.Body -match '<td[^>]*>Outages</td><td[^>]*>1, one still in progress</td>')
+$crossing = Get-DailySummary -Lines @('2026-09-14 06:50:00 | DOWN      | Declared DOWN for CapCity after 3 consecutive failures (Timed out).', '2026-09-14 07:20:00 | RESOLVED  | Outage record written: CapCity lasted 30m 00s over 180 failed polls. Recovery HTTP 200 from 1.2.3.4.') -NowLocal $d7 -SiteName 'CapCity' -HostName 'HOST1'
+Check "DS6 an outage that crossed the start of the window counts once with its length" ($crossing.Outages -eq 1 -and $crossing.Body -match '<td[^>]*>Outages</td><td[^>]*>1, lasting 30m 00s</td>')
+$carriedOut = Get-DailySummary -Lines @('2026-09-15 05:00:00 | CARRYOVER | Outage in progress since 2026-09-14 05:00:00 local carried over from before the restart (40 failed polls so far).', '2026-09-15 05:10:00 | CARRYOVER | Slow period since 2026-09-15 04:55:00 local carried over from before the restart.', '2026-09-15 05:20:00 | RESOLVED  | Outage record written: CapCity lasted 24h 20m 00s over 900 failed polls. Recovery HTTP 200 from 1.2.3.4.') -NowLocal $d7 -SiteName 'CapCity' -HostName 'HOST1'
+Check "DS6 an outage carried over a restart counts once, a carried slow period is not an outage" ($carriedOut.Outages -eq 1 -and $carriedOut.Body -match '<td[^>]*>Outages</td><td[^>]*>1, lasting 24h 20m 00s</td>')
+$one = Get-DailySummary -Lines @('2026-09-15 06:53:07 | FAIL      | Site=CapCity Code=000 Reason=Timed out') -NowLocal $d7 -SiteName 'CapCity' -HostName 'HOST1'
+Check "DS4 a single timeout is enough for a summary, singular wording" ($one.Subject -eq '[HST DAILY] CapCity (HOST1) - 0 slow polls, 1 failed poll, 0 outages in 24 hours' -and $one.Body -match '<td[^>]*>Slow polls</td><td[^>]*>None</td>')
+
+$genSlow = New-MonitorContent -SiteName 'S' -Mail $mRelay
+Check "SL12 generated monitor bakes the slow alert and summary settings" ($genSlow -match '(?m)^\$AlertOnSlow\s+=\s+\$true$' -and $genSlow -match '(?m)^\$SlowWindowMinutes\s+=\s+5$' -and $genSlow -match '(?m)^\$SlowAlertPercent\s+=\s+50$' -and $genSlow -match '(?m)^\$SlowClearPercent\s+=\s+10$' -and $genSlow -match '(?m)^\$DailySummaryHour\s+=\s+7$' -and $genSlow -match "(?m)^\`$SummaryStateFile\s+=\s+'.*\\daily-summary-sent\.txt'$")
+$saveSlow = @($AlertOnSlow, $SlowWindowMinutes, $SlowAlertPercent, $SlowClearPercent, $DailySummaryHour)
+$AlertOnSlow = $false; $SlowWindowMinutes = 0; $SlowAlertPercent = 5; $SlowClearPercent = 20; $DailySummaryHour = 30
+$genClamp = New-MonitorContent -SiteName 'S' -Mail $mRelay
+$DailySummaryHour = -9
+$genOff = New-MonitorContent -SiteName 'S' -Mail $mRelay
+$AlertOnSlow, $SlowWindowMinutes, $SlowAlertPercent, $SlowClearPercent, $DailySummaryHour = $saveSlow
+Check "SL12 settings are clamped: window at least 1, clear below alert, hour 23 or off" ($genClamp -match '(?m)^\$AlertOnSlow\s+=\s+\$false$' -and $genClamp -match '(?m)^\$SlowWindowMinutes\s+=\s+1$' -and $genClamp -match '(?m)^\$SlowAlertPercent\s+=\s+5$' -and $genClamp -match '(?m)^\$SlowClearPercent\s+=\s+4$' -and $genClamp -match '(?m)^\$DailySummaryHour\s+=\s+23$' -and $genOff -match '(?m)^\$DailySummaryHour\s+=\s+-1$' -and (ParseOk $genClamp))
+Check "SL13 loop evaluates slowness after the outage decision, gated emails, heartbeat carries it" ($template -match '(?s)\$decision = Update-MonitorState.*?\$slow = Update-SlowState -State \$slowState -Result \$result -Failed \$failed -IsDown \$state\.IsDown' -and $template -match 'if \(\$AlertOnSlow -and \$slow\.EmailSubject\)' -and ([regex]::Matches($template, 'Write-Heartbeat -State \$state -NowUtc [^\r\n]*-SlowState \$slowState')).Count -eq 3 -and $template -match 'Write-DropLog -Kind \$slow\.DropKind -Message \$slow\.TransitionLog')
+Check "SL13 daily summary reads the drops log once a day and records the date first" ($template -match '(?s)if \(Test-DailySummaryDue -NowLocal \(Get-Date\) -Hour \$DailySummaryHour -LastSentDate \$summarySent\) \{\s+\$summarySent = \(Get-Date\)\.ToString\(''yyyy-MM-dd''\)\s+try \{ Set-Content -Path \$SummaryStateFile' -and $template -match "Send-AlertOrQueue -Subject \`$summary\.Subject -Body \`$summary\.Body -Kind 'Summary'")
+Check "SL13 slow period carried over at startup unless an outage is" ($template -match 'if \(\$previous -and \$previous\.IsSlow -and \$null -ne \$previous\.SlowStartUtc -and -not \$state\.IsDown\)')
+Check "SL13 alert settings normalised before the first function, so the summary text matches the monitor" ($src -match '(?m)^\$DownThreshold\s+=\s+\[math\]::Max\(1, \[int\]\$DownThreshold\)$' -and $src -match '(?m)^\$SlowWindowMinutes\s+=\s+\[math\]::Max\(1, \[int\]\$SlowWindowMinutes\)$' -and $src -match '(?m)^\$SlowAlertPercent\s+=\s+\[math\]::Min\(100, \[math\]::Max\(1, \[int\]\$SlowAlertPercent\)\)$' -and $src -match '(?m)^\$SlowClearPercent\s+=\s+\[math\]::Max\(0, \[math\]::Min\(\[int\]\$SlowClearPercent, \$SlowAlertPercent - 1\)\)$' -and $src -match '(?m)^\$DailySummaryHour\s+=\s+\[math\]::Min\(23, \[math\]::Max\(-1, \[int\]\$DailySummaryHour\)\)$' -and $src.IndexOf('$DailySummaryHour      = [math]::Min(23') -lt $src.IndexOf('function Write-Log'))
+Check "SL13 heartbeat replace retried three times before warning" ($template -match '(?s)for \(\$attempt = 1; -not \$moved; \$attempt\+\+\) \{\s+try \{ Move-Item -Path \$tmp -Destination \$HeartbeatFile -Force -ErrorAction Stop; \$moved = \$true \}\s+catch \{ if \(\$attempt -ge 3\) \{ throw \}; Start-Sleep -Milliseconds 200 \}')
+Check "SL13 installer summary and install email describe the alert rules" ($src -match 'Write-Host "  Slow alert      : ' -and $src -match "'Slow alert' = " -and $src -match "'Daily summary' = ")
 
 Section "F. Live probe via curl.exe shim"
 $SiteName='T'; $ExpectedContentMarker=''; $MinPopulatedBytes=100; $TimeoutSeconds=10
