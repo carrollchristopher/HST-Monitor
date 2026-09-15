@@ -28,11 +28,28 @@ Requirements: Windows Server or Windows 10/11 with Windows PowerShell 5.1, curl.
 | File | Purpose |
 |---|---|
 | `Install-HSTMonitor.ps1` | The installer. Contains the monitor script as an embedded template. |
+| `Test-HSTMonitorHealth.ps1` | Checks an installed monitor: task, process, heartbeat, recorded polls, logs, mail secret, and a live probe. `-OutageDrill` simulates an outage end to end. |
 | `Test-HSTMailSend.ps1` | One-shot diagnostic for the Graph mail path on an installed server. |
 | `Stress-InstallHSTMonitor.ps1` | Static and functional checks for the installer and the generated monitor, including the wizard and the sign-in token path against a local mock. |
 | `Stress-WindowsHSTMonitor.ps1` | Live checks on Windows PowerShell 5.1: DPAPI, ACLs, task objects, and the generated monitor running against local listeners and the real endpoint. |
 | `Test-HSTMonitorInstallLocal.ps1` | End-to-end test that runs the real installer twice from an elevated console and verifies the result. |
 | `PSScriptAnalyzerSettings.psd1` | Analyzer settings with the deliberate rule exclusions. |
+
+## Checking a server
+
+Copy `Test-HSTMonitorHealth.ps1` to the server and run it from an elevated Windows PowerShell console.
+
+```powershell
+.\Test-HSTMonitorHealth.ps1
+```
+
+It changes nothing and ends with WORKING or NOT WORKING CORRECTLY. It reports the task and process, the heartbeat age, the last poll, response times and failures over the last hour and 24 hours, gaps in recording, warnings in the monitor's own log, the mail secret, and a probe of the endpoint from the server.
+
+```powershell
+.\Test-HSTMonitorHealth.ps1 -OutageDrill
+```
+
+The drill makes only the monitor's own probes fail for about a minute, using a curl settings file in the profile of the account the monitor runs as. Browsers and other programs keep working. It confirms the monitor declares DOWN, sends the DOWN email, records RESOLVED, and sends the RESOLVED email. The drill leaves one short outage in the outage log. If the window is closed during the drill, run the script again and it removes the file.
 
 ## Testing
 
