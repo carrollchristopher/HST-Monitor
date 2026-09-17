@@ -3,7 +3,7 @@ $script:pass=0; $script:fail=0; $script:failed=@()
 function Check($n,$c){ if($c){$script:pass++} else {$script:fail++; $script:failed += $n; Write-Host "FAIL: $n"} }
 function Section($n){ Write-Host ""; Write-Host "== $n ==" }
 
-$installerPath = 'C:\tmp\Install-HSTMonitor.ps1'
+$installerPath = 'C:\tmp\Install-CurlMonitor.ps1'
 $T=$null;$E=$null
 $ast=[System.Management.Automation.Language.Parser]::ParseFile($installerPath,[ref]$T,[ref]$E)
 $hereNodes = $ast.FindAll({param($n) $n -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $n.StringConstantType -eq 'SingleQuotedHereString'},$true)
@@ -84,7 +84,7 @@ Check "K1 Remove-SmtpCredential deletes the file" (-not (Test-Path $credPath))
 Section "L. Scheduled task objects built with the installer's exact parameters"
 Import-Module ScheduledTasks
 $RestartCount = 3; $RestartMinutes = 1; $RunAsUser = 'SYSTEM'
-$monitorPath = 'C:\ProgramData\DIT\HSTProbe\Watch-HSTeChartUptime.ps1'
+$monitorPath = 'C:\ProgramData\DIT\CurlMonitor\Watch-CurlMonitor.ps1'
 $taskOk = $true
 try {
     $action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$monitorPath`""
@@ -120,7 +120,7 @@ $stillRunning = -not $p.HasExited
 Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 2
 Check "M1 monitor process survived 45 s (send failures non-fatal)" $stillRunning
-$latCsv = Get-ChildItem $runDir -Filter 'HST-eChart-Latency_*.csv' | Select-Object -First 1
+$latCsv = Get-ChildItem $runDir -Filter 'Latency_*.csv' | Select-Object -First 1
 Check "M1 monthly latency CSV created" ($null -ne $latCsv)
 if ($latCsv) {
     $rows = @(Import-Csv $latCsv.FullName)
@@ -131,14 +131,14 @@ if ($latCsv) {
     Check "M1 every row classified failed with mapped reason (refused or timed out)" ($badRows.Count -eq 0)
     Check "M1 site name baked into rows" ($rows[0].SiteName -eq 'WinDown')
 }
-$logDown = Get-ChildItem $runDir -Filter 'HST-eChart-Monitor_*.log' | Select-Object -First 1
+$logDown = Get-ChildItem $runDir -Filter 'Transcript_*.log' | Select-Object -First 1
 Check "M1 daily transcript log created" ($null -ne $logDown)
 if ($logDown) {
     $logText = Get-Content $logDown.FullName -Raw
-    Check "M1 DOWN alert raised after threshold" ($logText -match '\[HST DOWN\] WinDown')
+    Check "M1 DOWN alert raised after threshold" ($logText -match '\[DOWN\] WinDown')
     Check "M1 mail send failure logged FAILED, loop continued" ($logText -match 'FAILED \|')
-    $dropM1 = Get-Content (Join-Path $runDir 'HST-eChart-Drops.log') -ErrorAction SilentlyContinue
-    Check "M1 drops log: start line, one FAIL per failed poll, DOWN, alert not sent, nothing healthy" ($dropM1 -and @($dropM1 | Where-Object { $_ -match '\| START     \|' }).Count -eq 1 -and @($dropM1 | Where-Object { $_ -match '\| FAIL      \| Site=WinDown Code=000' }).Count -ge 8 -and @($dropM1 | Where-Object { $_ -match '\| DOWN      \| Declared DOWN for WinDown after 3' }).Count -eq 1 -and @($dropM1 | Where-Object { $_ -match '\| ALERT     \| Not sent, retrying every minute.*\[HST DOWN\] WinDown' }).Count -eq 1 -and -not (($dropM1 -join "`n") -match 'SUCCESS|Code=200'))
+    $dropM1 = Get-Content (Join-Path $runDir 'Drops.log') -ErrorAction SilentlyContinue
+    Check "M1 drops log: start line, one FAIL per failed poll, DOWN, alert not sent, nothing healthy" ($dropM1 -and @($dropM1 | Where-Object { $_ -match '\| START     \|' }).Count -eq 1 -and @($dropM1 | Where-Object { $_ -match '\| FAIL      \| Site=WinDown Code=000' }).Count -ge 8 -and @($dropM1 | Where-Object { $_ -match '\| DOWN      \| Declared DOWN for WinDown after 3' }).Count -eq 1 -and @($dropM1 | Where-Object { $_ -match '\| ALERT     \| Not sent, retrying every minute.*\[DOWN\] WinDown' }).Count -eq 1 -and -not (($dropM1 -join "`n") -match 'SUCCESS|Code=200'))
     Check "M1 polling continued after the failed alert" (($logText -split "`n" | Select-String 'FAILED' | Select-Object -First 1).LineNumber -lt (Get-Content $logDown.FullName).Count - 3)
 }
 
@@ -155,7 +155,7 @@ $p2 = Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy By
 Start-Sleep -Seconds 20
 Stop-Process -Id $p2.Id -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 2
-$latCsv2 = Get-ChildItem $runDir2 -Filter 'HST-eChart-Latency_*.csv' | Select-Object -First 1
+$latCsv2 = Get-ChildItem $runDir2 -Filter 'Latency_*.csv' | Select-Object -First 1
 Check "M2 latency CSV created" ($null -ne $latCsv2)
 if ($latCsv2) {
     $rows2 = @(Import-Csv $latCsv2.FullName)
@@ -167,9 +167,9 @@ if ($latCsv2) {
     Check "M2 redirect time recorded and below total" ($rows2[0].RedirectMs -match '^\d+$' -and [int]$rows2[0].RedirectMs -gt 0 -and [int]$rows2[0].RedirectMs -le [int]$rows2[0].TotalMs)
     Check "M2 sign-in page body well above the minimum size" (@($rows2 | Where-Object { [int]$_.SizeBytes -lt 1000 }).Count -eq 0)
 }
-$logUp = Get-ChildItem $runDir2 -Filter 'HST-eChart-Monitor_*.log' | Select-Object -First 1
-Check "M2 no DOWN alert on healthy endpoint" ($null -ne $logUp -and -not ((Get-Content $logUp.FullName -Raw) -match '\[HST DOWN\]'))
-$dropM2 = @(Get-Content (Join-Path $runDir2 'HST-eChart-Drops.log') -ErrorAction SilentlyContinue)
+$logUp = Get-ChildItem $runDir2 -Filter 'Transcript_*.log' | Select-Object -First 1
+Check "M2 no DOWN alert on healthy endpoint" ($null -ne $logUp -and -not ((Get-Content $logUp.FullName -Raw) -match '\[DOWN\]'))
+$dropM2 = @(Get-Content (Join-Path $runDir2 'Drops.log') -ErrorAction SilentlyContinue)
 Check "M2 healthy endpoint: drops log holds only the start line (slow polls allowed)" ($dropM2.Count -ge 1 -and @($dropM2 | Where-Object { $_ -notmatch '\| (START|SLOW) +\|' }).Count -eq 0)
 
 # M4: full outage lifecycle: DOWN on closed port, then RESOLVED plus outage CSV row when the port comes up
@@ -211,20 +211,20 @@ Start-Sleep -Seconds 15
 Stop-Process -Id $p3.Id -Force -ErrorAction SilentlyContinue
 $srv | Wait-Job -Timeout 15 | Out-Null; $srv | Remove-Job -Force
 Start-Sleep -Seconds 2
-$logRec = Get-ChildItem $runDir3 -Filter 'HST-eChart-Monitor_*.log' | Select-Object -First 1
+$logRec = Get-ChildItem $runDir3 -Filter 'Transcript_*.log' | Select-Object -First 1
 Check "M4 transcript exists" ($null -ne $logRec)
 if ($logRec) {
     $recText = Get-Content $logRec.FullName -Raw
-    Check "M4 DOWN declared while port closed" ($recText -match '\[HST DOWN\] WinRecover')
-    Check "M4 RESOLVED raised when port came up" ($recText -match '\[HST RESOLVED\] WinRecover \([^)]+\) - outage lasted ')
+    Check "M4 DOWN declared while port closed" ($recText -match '\[DOWN\] WinRecover')
+    Check "M4 RESOLVED raised when port came up" ($recText -match '\[RESOLVED\] WinRecover \([^)]+\) - outage lasted ')
 }
-$outCsv = Join-Path $runDir3 'HST-eChart-Outages.csv'
+$outCsv = Join-Path $runDir3 'Outages.csv'
 Check "M4 outages CSV written" (Test-Path $outCsv)
 if (Test-Path $outCsv) {
     $out = @(Import-Csv $outCsv)
     Check "M4 exactly one outage record" ($out.Count -eq 1)
-    $dropM4 = Get-Content (Join-Path $runDir3 'HST-eChart-Drops.log') -ErrorAction SilentlyContinue
-    Check "M4 drops log: DOWN then RESOLVED with recovery code, alert lines for both" ($dropM4 -and (($dropM4 -join "`n") -match '\| DOWN      \| Declared DOWN for WinRecover') -and (($dropM4 -join "`n") -match '\| RESOLVED  \| Outage record written: WinRecover lasted .* Recovery HTTP 200 from 127\.0\.0\.1\.') -and @($dropM4 | Where-Object { $_ -match '\| ALERT     \| Not sent.*\[HST (DOWN|RESOLVED)\] WinRecover' }).Count -eq 2)
+    $dropM4 = Get-Content (Join-Path $runDir3 'Drops.log') -ErrorAction SilentlyContinue
+    Check "M4 drops log: DOWN then RESOLVED with recovery code, alert lines for both" ($dropM4 -and (($dropM4 -join "`n") -match '\| DOWN      \| Declared DOWN for WinRecover') -and (($dropM4 -join "`n") -match '\| RESOLVED  \| Outage record written: WinRecover lasted .* Recovery HTTP 200 from 127\.0\.0\.1\.') -and @($dropM4 | Where-Object { $_ -match '\| ALERT     \| Not sent.*\[(DOWN|RESOLVED)\] WinRecover' }).Count -eq 2)
     Check "M4 record fields sane (duration, polls, recovery 200)" ($out[0].SiteName -eq 'WinRecover' -and [int]$out[0].DurationSeconds -ge 3 -and [int]$out[0].FailedPolls -ge 3 -and $out[0].RecoveryCode -eq '200' -and $out[0].OutageStart_UTC -and $out[0].OutageEnd_UTC)
 }
 
@@ -241,7 +241,7 @@ Set-Content $monRs -Value $genRs -Encoding UTF8
 $nowUtc = (Get-Date).ToUniversalTime()
 $onsetUtc = $nowUtc.AddMinutes(-15)
 $hb6 = [ordered]@{ Beat = $nowUtc.AddMinutes(-10).ToString('o'); IsDown = $true; ConsecutiveFailures = 90; OutageStartUtc = $onsetUtc.ToString('o'); OutageStartLocalStr = $onsetUtc.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss'); OutageStartUtcStr = $onsetUtc.ToString('yyyy-MM-dd HH:mm:ss'); LastAlertUtc = $onsetUtc.ToString('o'); AlertDelivered = $false }
-$hb6 | ConvertTo-Json -Compress | Set-Content (Join-Path $runDir6 'monitor-heartbeat.json') -Encoding UTF8
+$hb6 | ConvertTo-Json -Compress | Set-Content (Join-Path $runDir6 'heartbeat.json') -Encoding UTF8
 $srv6 = Start-Job -ScriptBlock {
     param($port)
     $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $port)
@@ -270,20 +270,20 @@ Start-Sleep -Seconds 25
 Stop-Process -Id $p6.Id -Force -ErrorAction SilentlyContinue
 $srv6 | Wait-Job -Timeout 30 | Out-Null; $srv6 | Remove-Job -Force
 Start-Sleep -Seconds 2
-$logRs = Get-ChildItem $runDir6 -Filter 'HST-eChart-Monitor_*.log' | Select-Object -First 1
+$logRs = Get-ChildItem $runDir6 -Filter 'Transcript_*.log' | Select-Object -First 1
 Check "M6 transcript exists" ($null -ne $logRs)
 if ($logRs) {
     $rsText = Get-Content $logRs.FullName -Raw
     Check "M6 gap detected and outage carry-over logged" ($rsText -match 'The monitor was not running for 10m [0-2]\ds' -and $rsText -match 'outage was in progress at the last heartbeat')
-    Check "M6 restart notice queued for retry (mail path is down here)" ($rsText -match "'\[HST MONITOR RESTARTED\] WinRestart \($env:COMPUTERNAME\) - not running for 10m [0-2]\ds' will be retried")
-    Check "M6 RESOLVED from the original onset, 15 minutes ago" ($rsText -match '\[HST RESOLVED\] WinRestart \([^)]+\) - outage lasted 15m [0-2]\ds')
+    Check "M6 restart notice queued for retry (mail path is down here)" ($rsText -match "'\[MONITOR RESTARTED\] WinRestart \($env:COMPUTERNAME\) - not running for 10m [0-2]\ds' will be retried")
+    Check "M6 RESOLVED from the original onset, 15 minutes ago" ($rsText -match '\[RESOLVED\] WinRestart \([^)]+\) - outage lasted 15m [0-2]\ds')
     Check "M6 RESOLVED superseded nothing but the outage alerts, restart notice still queued" (-not ($rsText -match 'Dropping undelivered'))
-    Check "M6 no DOWN declared on a healthy endpoint" (-not ($rsText -match '\[HST DOWN\]'))
+    Check "M6 no DOWN declared on a healthy endpoint" (-not ($rsText -match '\[DOWN\]'))
 }
-$outCsv6 = Join-Path $runDir6 'HST-eChart-Outages.csv'
+$outCsv6 = Join-Path $runDir6 'Outages.csv'
 Check "M6 outage record spans the gap with the pre-restart poll count" ((Test-Path $outCsv6) -and (& { $o = @(Import-Csv $outCsv6); $o.Count -eq 1 -and [int]$o[0].DurationSeconds -ge 900 -and [int]$o[0].DurationSeconds -le 990 -and [int]$o[0].FailedPolls -eq 90 -and $o[0].RecoveryCode -eq '200' }))
-$hbAfter = Get-Content (Join-Path $runDir6 'monitor-heartbeat.json') -Raw | ConvertFrom-Json
-$dropM6 = Get-Content (Join-Path $runDir6 'HST-eChart-Drops.log') -ErrorAction SilentlyContinue
+$hbAfter = Get-Content (Join-Path $runDir6 'heartbeat.json') -Raw | ConvertFrom-Json
+$dropM6 = Get-Content (Join-Path $runDir6 'Drops.log') -ErrorAction SilentlyContinue
 Check "M6 drops log: RESTART with cause, CARRYOVER with onset and polls, RESOLVED from the true onset" ($dropM6 -and (($dropM6 -join "`n") -match '\| RESTART   \| Monitor was not running for 10m [0-2]\ds\. Server did not restart') -and (($dropM6 -join "`n") -match '\| CARRYOVER \| Outage in progress since .* \(90 failed polls so far\)') -and (($dropM6 -join "`n") -match '\| RESOLVED  \| Outage record written: WinRestart lasted 15m [0-2]\ds over 90 failed polls'))
 Check "M6 heartbeat rewritten as up with a fresh beat" (-not $hbAfter.IsDown -and ([datetime]::Parse($hbAfter.Beat, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind)).ToUniversalTime() -gt $nowUtc)
 
@@ -300,7 +300,7 @@ Set-Content $monSt -Value $genSt -Encoding UTF8
 $nowUtc8 = (Get-Date).ToUniversalTime()
 $onset8 = $nowUtc8.AddMinutes(-20)
 $hb8 = [ordered]@{ Beat = $nowUtc8.AddHours(-3).ToString('o'); IsDown = $true; ConsecutiveFailures = 40; OutageStartUtc = $onset8.ToString('o'); OutageStartLocalStr = $onset8.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss'); OutageStartUtcStr = $onset8.ToString('yyyy-MM-dd HH:mm:ss'); LastAlertUtc = $onset8.ToString('o'); AlertDelivered = $true; Stopped = $true }
-$hb8 | ConvertTo-Json -Compress | Set-Content (Join-Path $runDir8 'monitor-heartbeat.json') -Encoding UTF8
+$hb8 | ConvertTo-Json -Compress | Set-Content (Join-Path $runDir8 'heartbeat.json') -Encoding UTF8
 $srv8 = Start-Job -ScriptBlock {
     param($port)
     $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $port)
@@ -324,10 +324,10 @@ Start-Sleep -Seconds 20
 Stop-Process -Id $p8.Id -Force -ErrorAction SilentlyContinue
 $srv8 | Wait-Job -Timeout 20 | Out-Null; $srv8 | Remove-Job -Force
 Start-Sleep -Seconds 2
-$stText = (Get-ChildItem $runDir8 -Filter 'HST-eChart-Monitor_*.log' | Select-Object -First 1 | Get-Content -Raw)
-$dropM8 = @(Get-Content (Join-Path $runDir8 'HST-eChart-Drops.log') -ErrorAction SilentlyContinue)
-Check "M8 deliberate stop: no restart notice after a 3 h gap, outage carried over" ($stText -match 'Monitor restarted after a deliberate stop' -and $stText -match 'outage was in progress at the last heartbeat' -and -not ($stText -cmatch '\[HST MONITOR RESTARTED\]'))
-Check "M8 deliberate stop: RESOLVED from the 20 min onset with 40 carried polls, DOWN alert marked delivered" ($stText -match '\[HST RESOLVED\] WinStopped \([^)]+\) - outage lasted 20m [0-2]\ds' -and @($dropM8 | Where-Object { $_ -match '\| RESOLVED  \| Outage record written: WinStopped lasted 20m [0-2]\ds over 40 failed polls' }).Count -eq 1 -and @($dropM8 | Where-Object { $_ -match '\| CARRYOVER \|' }).Count -eq 1 -and @($dropM8 | Where-Object { $_ -match '\| RESTART' }).Count -eq 0)
+$stText = (Get-ChildItem $runDir8 -Filter 'Transcript_*.log' | Select-Object -First 1 | Get-Content -Raw)
+$dropM8 = @(Get-Content (Join-Path $runDir8 'Drops.log') -ErrorAction SilentlyContinue)
+Check "M8 deliberate stop: no restart notice after a 3 h gap, outage carried over" ($stText -match 'Monitor restarted after a deliberate stop' -and $stText -match 'outage was in progress at the last heartbeat' -and -not ($stText -cmatch '\[MONITOR RESTARTED\]'))
+Check "M8 deliberate stop: RESOLVED from the 20 min onset with 40 carried polls, DOWN alert marked delivered" ($stText -match '\[RESOLVED\] WinStopped \([^)]+\) - outage lasted 20m [0-2]\ds' -and @($dropM8 | Where-Object { $_ -match '\| RESOLVED  \| Outage record written: WinStopped lasted 20m [0-2]\ds over 40 failed polls' }).Count -eq 1 -and @($dropM8 | Where-Object { $_ -match '\| CARRYOVER \|' }).Count -eq 1 -and @($dropM8 | Where-Object { $_ -match '\| RESTART' }).Count -eq 0)
 
 # M7: crash without a heartbeat gap is quiet, and a fresh install (no heartbeat) sends no notice
 $runDir7 = Join-Path $scratch 'run_fresh'
@@ -345,11 +345,11 @@ $p7b = Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy B
 Start-Sleep -Seconds 12
 Stop-Process -Id $p7b.Id -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 2
-$frText = (Get-ChildItem $runDir7 -Filter 'HST-eChart-Monitor_*.log' | Select-Object -First 1 | Get-Content -Raw)
-Check "M7 first start (no heartbeat) sends no restart notice" (-not ($frText -match '\[HST MONITOR RESTARTED\]') -and (Test-Path (Join-Path $runDir7 'monitor-heartbeat.json')))
-$dropM7 = @(Get-Content (Join-Path $runDir7 'HST-eChart-Drops.log') -ErrorAction SilentlyContinue)
+$frText = (Get-ChildItem $runDir7 -Filter 'Transcript_*.log' | Select-Object -First 1 | Get-Content -Raw)
+Check "M7 first start (no heartbeat) sends no restart notice" (-not ($frText -match '\[MONITOR RESTARTED\]') -and (Test-Path (Join-Path $runDir7 'heartbeat.json')))
+$dropM7 = @(Get-Content (Join-Path $runDir7 'Drops.log') -ErrorAction SilentlyContinue)
 Check "M7 two starts, no RESTART line for a quick restart, FAIL lines only" (@($dropM7 | Where-Object { $_ -match '\| START     \|' }).Count -eq 2 -and @($dropM7 | Where-Object { $_ -match '\| RESTART' }).Count -eq 0 -and @($dropM7 | Where-Object { $_ -notmatch '\| (START|FAIL|DOWN|ALERT|STOP|CARRYOVER) +\|' }).Count -eq 0)
-Check "M7 quick restart is logged below the threshold, no notice" ($frText -match 'Monitor restarted after a \d+ s gap, below the notice threshold' -and -not ($frText -match '\[HST MONITOR RESTARTED\]'))
+Check "M7 quick restart is logged below the threshold, no notice" ($frText -match 'Monitor restarted after a \d+ s gap, below the notice threshold' -and -not ($frText -match '\[MONITOR RESTARTED\]'))
 
 # M5: latency CSV held open exclusively by another program: polls skipped with a warning, DOWN alert still fires, file not moved aside
 $runDir5 = Join-Path $scratch 'run_locked'
@@ -360,21 +360,21 @@ $IntervalSeconds = 1; $TimeoutSeconds = 2; $DownThreshold = 3; $ExpectedContentM
 $genLock = New-MonitorContent -SiteName 'WinLocked' -Mail $mailDown
 $monLock = Join-Path $runDir5 'monitor.ps1'
 Set-Content $monLock -Value $genLock -Encoding UTF8
-$csvLock = Join-Path $runDir5 ("HST-eChart-Latency_" + (Get-Date -Format 'yyyyMM') + ".csv")
+$csvLock = Join-Path $runDir5 ("Latency_" + (Get-Date -Format 'yyyyMM') + ".csv")
 $fsLock = [System.IO.File]::Open($csvLock, [System.IO.FileMode]::Create, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
 $p5 = Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$monLock`"" -WindowStyle Hidden -PassThru
 Start-Sleep -Seconds 20
 Stop-Process -Id $p5.Id -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 2
 $fsLock.Close()
-$logLock = Get-ChildItem $runDir5 -Filter 'HST-eChart-Monitor_*.log' | Select-Object -First 1
+$logLock = Get-ChildItem $runDir5 -Filter 'Transcript_*.log' | Select-Object -First 1
 Check "M5 transcript exists" ($null -ne $logLock)
 if ($logLock) {
     $lockText = Get-Content $logLock.FullName -Raw
-    Check "M5 DOWN declared while the latency CSV was locked" ($lockText -match '\[HST DOWN\] WinLocked')
+    Check "M5 DOWN declared while the latency CSV was locked" ($lockText -match '\[DOWN\] WinLocked')
     Check "M5 skipped polls logged as warnings, no cycle errors" ($lockText -match 'Could not append to' -and -not ($lockText -match 'Probe cycle error'))
 }
-Check "M5 locked CSV not moved aside" (@(Get-ChildItem $runDir5 -Filter 'HST-eChart-Latency_*_schema-*.csv').Count -eq 0)
+Check "M5 locked CSV not moved aside" (@(Get-ChildItem $runDir5 -Filter 'Latency_*_schema-*.csv').Count -eq 0)
 
 # M9: sustained slow responses raise SLOW, recovery raises SLOW RESOLVED, and a due daily summary goes out on the first poll
 $runDir9 = Join-Path $scratch 'run_slow'
@@ -390,8 +390,8 @@ $genSlow9 = New-MonitorContent -SiteName 'WinSlow' -Mail $mailDown
 $SlowThresholdMs, $SlowWindowMinutes, $SlowAlertPercent, $SlowClearPercent, $AlertOnSlow, $DailySummaryHour = $saved9
 $monSlow9 = Join-Path $runDir9 'monitor.ps1'
 Set-Content $monSlow9 -Value $genSlow9 -Encoding UTF8
-Set-Content (Join-Path $runDir9 'HST-eChart-Drops.log') -Value ("{0} | {1,-9} | {2}" -f (Get-Date).AddHours(-1).ToString('yyyy-MM-dd HH:mm:ss'), 'FAIL', 'Site=WinSlow Code=000 Redirects=0 TTFB=5000ms Total=5000ms Populated=False IP= Reason=Timed out') -Encoding UTF8
-Set-Content (Join-Path $runDir9 'daily-summary-sent.txt') -Value (Get-Date).AddDays(-1).ToString('yyyy-MM-dd') -Encoding ASCII
+Set-Content (Join-Path $runDir9 'Drops.log') -Value ("{0} | {1,-9} | {2}" -f (Get-Date).AddHours(-1).ToString('yyyy-MM-dd HH:mm:ss'), 'FAIL', 'Site=WinSlow Code=000 Redirects=0 TTFB=5000ms Total=5000ms Populated=False IP= Reason=Timed out') -Encoding UTF8
+Set-Content (Join-Path $runDir9 'summary-sent.txt') -Value (Get-Date).AddDays(-1).ToString('yyyy-MM-dd') -Encoding ASCII
 $srv9 = Start-Job -ScriptBlock {
     param($port, $flag)
     $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $port)
@@ -424,17 +424,17 @@ Start-Sleep -Seconds 95
 Stop-Process -Id $p9.Id -Force -ErrorAction SilentlyContinue
 $srv9 | Stop-Job -ErrorAction SilentlyContinue; $srv9 | Remove-Job -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 2
-$drop9 = @(Get-Content (Join-Path $runDir9 'HST-eChart-Drops.log') -ErrorAction SilentlyContinue)
+$drop9 = @(Get-Content (Join-Path $runDir9 'Drops.log') -ErrorAction SilentlyContinue)
 $drop9Text = $drop9 -join "`n"
-$log9 = (Get-ChildItem $runDir9 -Filter 'HST-eChart-Monitor_*.log' | Select-Object -First 1 | Get-Content -Raw)
+$log9 = (Get-ChildItem $runDir9 -Filter 'Transcript_*.log' | Select-Object -First 1 | Get-Content -Raw)
 Check "M9 START line states the slow alert rule" ($drop9Text -match '\| START +\| Monitor started on .* slow at 50% of polls over 1000 ms or failed in 1 min\)\.')
 Check "M9 slow responses logged as SLOW lines, no failures, no outage" (@($drop9 | Where-Object { $_ -match '\| SLOW +\| Site=WinSlow Code=200' }).Count -ge 10 -and -not ($drop9Text -match '\| DOWN +\|') -and @($drop9 | Where-Object { $_ -match '\| FAIL +\|' }).Count -eq 1)
 Check "M9 SLOW declared once while the endpoint was slow" (@($drop9 | Where-Object { $_ -match '\| SLOWSTART \| Declared SLOW for WinSlow: \d+ polls in 1 min: \d+ slower than 1000 ms, 0 failed \(median \d+ ms, worst \d+ ms\)\.' }).Count -eq 1)
 Check "M9 slow period closed after recovery with its totals" (@($drop9 | Where-Object { $_ -match '\| SLOWCLEAR \| Slow period over for WinSlow: lasted \d+m \d+s, \d+ polls, \d+ slow, 0 failed, worst \d+ ms\.' }).Count -eq 1)
-Check "M9 SLOW and SLOW RESOLVED emails attempted in order" ($drop9Text -match '(?s)\| ALERT +\| Not sent, retrying every minute for up to 60 minutes: \[HST SLOW\] WinSlow \([^)]+\) - \d+ of \d+ polls slow or failed in 1 min.*\| SLOWCLEAR .*\[HST SLOW RESOLVED\] WinSlow \([^)]+\) - slow period lasted ')
-Check "M9 heartbeat ends not slow" (-not (Get-Content (Join-Path $runDir9 'monitor-heartbeat.json') -Raw | ConvertFrom-Json).IsSlow)
-Check "M9 due daily summary built from the drops log and sent on the first poll" ($log9 -match 'Daily summary: \[HST DAILY\] WinSlow \([^)]+\) - 0 slow polls, 1 failed poll, 0 outages in 24 hours' -and $drop9Text -match '\| ALERT +\| Not sent, retrying every minute for up to 60 minutes: \[HST DAILY\] WinSlow')
-Check "M9 summary date recorded, so it is not sent twice" ((Get-Content (Join-Path $runDir9 'daily-summary-sent.txt') -TotalCount 1) -eq (Get-Date).ToString('yyyy-MM-dd') -and @([regex]::Matches($log9, 'Daily summary: ')).Count -eq 1)
+Check "M9 SLOW and SLOW RESOLVED emails attempted in order" ($drop9Text -match '(?s)\| ALERT +\| Not sent, retrying every minute for up to 60 minutes: \[SLOW\] WinSlow \([^)]+\) - \d+ of \d+ polls slow or failed in 1 min.*\| SLOWCLEAR .*\[SLOW RESOLVED\] WinSlow \([^)]+\) - slow period lasted ')
+Check "M9 heartbeat ends not slow" (-not (Get-Content (Join-Path $runDir9 'heartbeat.json') -Raw | ConvertFrom-Json).IsSlow)
+Check "M9 due daily summary built from the drops log and sent on the first poll" ($log9 -match 'Daily summary: \[DAILY\] WinSlow \([^)]+\) - 0 slow polls, 1 failed poll, 0 outages in 24 hours' -and $drop9Text -match '\| ALERT +\| Not sent, retrying every minute for up to 60 minutes: \[DAILY\] WinSlow')
+Check "M9 summary date recorded, so it is not sent twice" ((Get-Content (Join-Path $runDir9 'summary-sent.txt') -TotalCount 1) -eq (Get-Date).ToString('yyyy-MM-dd') -and @([regex]::Matches($log9, 'Daily summary: ')).Count -eq 1)
 
 # M3: no plaintext secret anywhere in any artifact
 $leak = Get-ChildItem $scratch -Recurse -File | Where-Object { (Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue) -like "*s3cret-O'Brien*" }

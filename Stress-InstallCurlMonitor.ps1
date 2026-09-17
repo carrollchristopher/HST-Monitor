@@ -3,7 +3,7 @@ $script:pass=0; $script:fail=0; $script:failed=@()
 function Check($n,$c){ if($c){$script:pass++} else {$script:fail++; $script:failed += $n; Write-Host "FAIL: $n"} }
 function Section($n){ Write-Host ""; Write-Host "== $n ==" }
 
-$installerPath = '/tmp/Install-HSTMonitor.ps1'
+$installerPath = '/tmp/Install-CurlMonitor.ps1'
 $src = Get-Content -Raw $installerPath
 $T=$null;$E=$null
 $ast=[System.Management.Automation.Language.Parser]::ParseFile($installerPath,[ref]$T,[ref]$E)
@@ -47,13 +47,13 @@ foreach ($a in @($ast,$tAst)) {
 Check "All Write-Log levels approved" ($badLevels.Count -eq 0)
 
 # Every email subject literal starts with [HST
-$subjects = [regex]::Matches($src,'"\[HST [A-Z ]+\][^"]*"') | % { $_.Value }
+$subjects = [regex]::Matches($src,'"\[[A-Z ]+\][^"]*"') | % { $_.Value }
 Check "Found subject literals ($($subjects.Count))" ($subjects.Count -ge 5)
-$subjectTypes = $subjects | % { ([regex]::Match($_,'\[HST ([A-Z ]+)\]')).Groups[1].Value } | Sort-Object -Unique
+$subjectTypes = $subjects | % { ([regex]::Match($_,'\[([A-Z ]+)\]')).Groups[1].Value } | Sort-Object -Unique
 Check "Subject set is exactly DAILY/DOWN/MONITOR INSTALLED/MONITOR RESTARTED/MONITOR TEST/RESOLVED/SLOW/SLOW RESOLVED/STILL DOWN/STILL SLOW" ((($subjectTypes -join '|')) -eq 'DAILY|DOWN|MONITOR INSTALLED|MONITOR RESTARTED|MONITOR TEST|RESOLVED|SLOW|SLOW RESOLVED|STILL DOWN|STILL SLOW')
 Check "Every subject carries the site name variable" (($subjects | Where-Object { $_ -notmatch '\$SiteName|\$site' }).Count -eq 0)
 
-Check "Single deliverable: only Install-HSTMonitor.ps1 among installer files" ((Get-ChildItem /mnt/user-data/outputs -Filter '*HSTMonitor*.ps1').Count -eq 1)
+Check "Single deliverable: only Install-CurlMonitor.ps1 among installer files" ((Get-ChildItem /mnt/user-data/outputs -Filter '*CurlMonitor*.ps1').Count -eq 1)
 Check "No dedicatedit.com or DIT-specific addresses anywhere" (-not ($src -match 'dedicatedit'))
 Check "Sender and recipients have no baked defaults" ($src -match '(?m)^\$MailFrom\s+=\s+""' -and $src -match '(?m)^\$MailTo\s+=\s+@\(\)')
 Check "Policy group derived from sender domain" ($src -match '\$policyGroup = "\$GraphPolicyGroupAlias@" \+')
@@ -76,7 +76,7 @@ Check "No plaintext-to-SecureString cmdlet anywhere" (-not ($src -match 'Convert
 Check "ConvertTo-SecureText defined once in the installer and once in the monitor" (([regex]::Matches($src, '(?m)^function ConvertTo-SecureText \{')).Count -eq 2)
 Check "Protect-Secret takes the prompt SecureString or in-memory text" ($src -match "ParameterSetName = 'Secure'\)\]\[securestring\]\`$Password" -and $src -match "ParameterSetName = 'Plain'\)\]\[string\]\`$PlainText")
 Check "Drops log gets failed and slow polls, transitions, alerts, starts, restarts, never a healthy poll" ($template -match "Write-DropLog -Kind 'FAIL'" -and $template -match "Write-DropLog -Kind 'SLOW'" -and $template -match "Write-DropLog -Kind 'DOWN'" -and $template -match "Write-DropLog -Kind 'REMINDER'" -and $template -match "Write-DropLog -Kind 'RESOLVED'" -and $template -match "Write-DropLog -Kind 'RESTART'" -and $template -match "Write-DropLog -Kind 'CARRYOVER'" -and $template -match "Write-DropLog -Kind 'ALERT'" -and $template -match "Write-DropLog -Kind 'START'" -and $template -match "Write-DropLog -Kind 'STOP'" -and $template -match '(?m)^\s*else \{ Write-Log -Level SUCCESS -Message \$summary \}\s*$')
-Check "Drops log is not pruned with the daily transcripts" ($template -match "Filter 'HST-eChart-Monitor_\*\.log'" -and $template -match "HST-eChart-Drops\.log" -and -not ($template -match "Filter 'HST-eChart-\*"))
+Check "Drops log is not pruned with the daily transcripts" ($template -match "Filter 'Transcript_\*\.log'" -and $template -match "Drops\.log" -and -not ($template -match "Filter 'HST-eChart-\*"))
 Check "Stored secret offered only for the same Graph app" ($src -match "if \(\`$Saved -and \`$Saved\.MailMethod -eq 'Graph' -and \`$Saved\.CredentialFor -eq \`$client\) \{ Get-StoredSecret \}")
 Check "Installer decrypts the stored secret in one place" (([regex]::Matches($src, 'ProtectedData\]::Unprotect')).Count -eq 2 -and $src -match 'function Get-StoredSecret')
 Check "Analyzer settings file present and names only warning-level style rules" ((Test-Path 'C:\Workspaces\HST Monitor\PSScriptAnalyzerSettings.psd1') -and -not ((Get-Content 'C:\Workspaces\HST Monitor\PSScriptAnalyzerSettings.psd1' -Raw) -match 'SecureString|PlainText|Credential|Password'))
@@ -84,9 +84,9 @@ Check "No parameter shadows an automatic variable" (-not ($src -match '(?i)\[str
 Check "Non-interactive Graph refused (secret needs console)" ($src -match "Graph cannot be configured non-interactively")
 Check "Probe follows redirects with a bounded hop count" ($template -match '-L --max-redirs \$MaxRedirects' -and $src -match '(?m)^\$MaxRedirects\s+=\s+5')
 Check "Install-time preflight follows redirects too" ($src -match 'function Test-EndpointReachable[\s\S]*?-L --max-redirs \$MaxRedirects')
-Check "Sign-in page marker is the default" ($src -match '(?m)^\$ExpectedContentMarker\s+=\s+"HST Federation Provider"')
+Check "URL, monitor name, and content marker are prompted, not hardcoded" ($src -match '(?m)^\$Url\s+=\s+""\s' -and $src -match '(?m)^\$MonitorName\s+=\s+""\s' -and $src -match '(?m)^\$ExpectedContentMarker\s+=\s+""\s' -and $src -match 'function Get-MonitorUrl' -and $src -match 'function Get-MonitorName' -and $src -match 'function Get-ContentMarker')
 Check "Task cmdlets stop on error and registration is verified" ($src -match 'Register-ScheduledTask[^\n]*-ErrorAction Stop' -and $src -match 'Get-ScheduledTask -TaskName \$TaskName -TaskPath \$TaskPath -ErrorAction Stop' -and $src -match 'Start-ScheduledTask -TaskName \$TaskName -TaskPath \$TaskPath -ErrorAction Stop')
-Check "Existing task replaced in place, never unregistered first" (-not ($src -match 'Unregister-ScheduledTask') -and $src -match 'Register-ScheduledTask[^\n]*-Force')
+Check "Existing task replaced in place, unregister only for the older install" ((([regex]::Matches($src, 'Unregister-ScheduledTask')).Count -eq 1) -and $src -match '(?s)function Invoke-LegacyMigration.*?Unregister-ScheduledTask' -and $src -match 'Register-ScheduledTask[^\n]*-Force')
 Check "Monitor staged as .new and swapped in after verification" ($src -match '\$stagedPath = "\$monitorPath\.new"' -and $src -match 'Move-Item -Path \$stagedPath -Destination \$monitorPath -Force -ErrorAction Stop')
 Check "InstalledAt recorded only after the task is running" ($src -match "(?s)if \(\`$taskState -eq 'Running'\) \{\s*\`$settings\['InstalledAt'\]")
 Check "Monitor failure test includes the curl exit code" ($template -match '\$failed\s+=\s+\(\$result\.CurlExit -ne 0\) -or')
@@ -206,7 +206,7 @@ $NonInteractive=$false
 Section "D. Monitor functions: extract from generated monitor"
 $gT=$null;$gE=$null
 $gAst=[System.Management.Automation.Language.Parser]::ParseInput($gen,[ref]$gT,[ref]$gE)
-foreach ($f in $gAst.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in @('ConvertTo-Ms','Format-Duration','Get-CurlReason','Get-LatencyCsvPath','Write-CsvRow','Get-TranscriptPath','Update-MonitorState','Get-HSTProbeResult','Get-SecretExpiryWarning','New-AlertBody','Write-Heartbeat','Read-Heartbeat','Get-RestartNotice','Send-AlertOrQueue','Send-PendingAlert','Wait-NetworkReady','Get-SmtpCredential','ConvertTo-SecureText','Write-DropLog','Update-SlowState','Test-DailySummaryDue','Get-DailySummary')},$true)) { Invoke-Expression $f.Extent.Text }
+foreach ($f in $gAst.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -in @('ConvertTo-Ms','Format-Duration','Get-CurlReason','Get-LatencyCsvPath','Write-CsvRow','Get-TranscriptPath','Update-MonitorState','Get-ProbeResult','Get-SecretExpiryWarning','New-AlertBody','Write-Heartbeat','Read-Heartbeat','Get-RestartNotice','Send-AlertOrQueue','Send-PendingAlert','Wait-NetworkReady','Get-SmtpCredential','ConvertTo-SecureText','Write-DropLog','Update-SlowState','Test-DailySummaryDue','Get-DailySummary','Get-AlertLabel')},$true)) { Invoke-Expression $f.Extent.Text }
 $InstallDir = '/tmp/hstprobe_test'; if (Test-Path $InstallDir){Remove-Item $InstallDir -Recurse -Force}; New-Item $InstallDir -ItemType Directory | Out-Null
 
 Check "Ms: 0.123456 -> 123" ((ConvertTo-Ms '0.123456') -eq 123)
@@ -220,7 +220,7 @@ Check "CurlReason 7" ((Get-CurlReason 7) -eq 'Connection refused or unreachable'
 Check "CurlReason unknown" ((Get-CurlReason 99) -eq 'curl exit 99')
 Check "CurlReason 47" ((Get-CurlReason 47) -eq 'Too many redirects')
 Check "CurlReason 18" ((Get-CurlReason 18) -eq 'Transfer ended early (partial body)')
-Check "Latency path monthly" ((Get-LatencyCsvPath) -match 'HST-eChart-Latency_\d{6}\.csv$')
+Check "Latency path monthly" ((Get-LatencyCsvPath) -match 'Latency_\d{6}\.csv$')
 $today=[datetime]'2026-09-04'
 Check "Expiry blank -> null" ($null -eq (Get-SecretExpiryWarning -ExpiresOn '' -Today $today))
 Check "Expiry garbage -> null" ($null -eq (Get-SecretExpiryWarning -ExpiresOn 'soon' -Today $today))
@@ -228,7 +228,7 @@ Check "Expiry 31d -> null" ($null -eq (Get-SecretExpiryWarning -ExpiresOn '2026-
 Check "Expiry 30d -> warn" ((Get-SecretExpiryWarning -ExpiresOn '2026-10-04' -Today $today) -match 'expires in 30 day')
 Check "Expiry today -> warn 0" ((Get-SecretExpiryWarning -ExpiresOn '2026-09-04' -Today $today) -match 'expires in 0 day')
 Check "Expiry yesterday -> EXPIRED" ((Get-SecretExpiryWarning -ExpiresOn '2026-09-03' -Today $today) -match 'EXPIRED')
-Check "Transcript path daily"  ((Get-TranscriptPath) -match 'HST-eChart-Monitor_\d{8}\.log$')
+Check "Transcript path daily"  ((Get-TranscriptPath) -match 'Transcript_\d{8}\.log$')
 
 # CSV schema mismatch handling
 $csv = Join-Path $InstallDir 'schema.csv'
@@ -281,7 +281,7 @@ function Res($code,$ok,$reason='Timed out') { [PSCustomObject]@{ Timestamp_Local
 $T0 = [datetime]::SpecifyKind([datetime]'2026-09-04T12:00:00','Utc')
 function Step { param([hashtable]$State,[bool]$Failed,[datetime]$Now,[int]$Dt=3,[int]$Re=30,[bool]$Aor=$true,$Result=$null)
   if ($null -eq $Result){ $Result = Res '000' $false }
-  Update-MonitorState -State $State -Failed $Failed -Result $Result -NowUtc $Now -DownThreshold $Dt -ReAlertMinutes $Re -AlertOnRecovery $Aor -SiteName 'CapCity' -Url 'http://x' -HostName 'HOST1' }
+  Update-MonitorState -State $State -Failed $Failed -Result $Result -NowUtc $Now -DownThreshold $Dt -ReAlertMinutes $Re -AlertOnRecovery $Aor -SiteName 'CapCity' -Url 'http://x' -HostName 'HOST1' -MonitorName 'eChart' }
 
 $st=NewState; $any=$false
 for($i=0;$i -le 5;$i++){ $d=Step $st $false $T0.AddSeconds($i*10); $st=$d.State; if($d.EmailSubject){$any=$true} }
@@ -295,12 +295,12 @@ Check "S2 blip recover: no record, no email, reset" ($null -eq $d.OutageRecord -
 $st=NewState; $orig = $st.Clone()
 $d1=Step $st $true $T0; $st=$d1.State; $d2=Step $st $true $T0.AddSeconds(10); $st=$d2.State; $d3=Step $st $true $T0.AddSeconds(20); $st=$d3.State
 Check "S3 no email before threshold" ($null -eq $d1.EmailSubject -and $null -eq $d2.EmailSubject)
-Check "S3 DOWN at 3rd, subject names site and server" ($d3.EmailSubject -eq '[HST DOWN] CapCity (HOST1) - HST eChart unreachable')
+Check "S3 DOWN at 3rd, subject names site and server" ($d3.EmailSubject -eq '[DOWN] eChart at CapCity (HOST1) - unreachable')
 Check "S3 DOWN body is HTML with server and reason rows" ($d3.EmailBody -match '^<html>' -and $d3.EmailBody -match '<td[^>]*>Server</td><td[^>]*>HOST1</td>' -and $d3.EmailBody -match '<td[^>]*>Reason</td><td[^>]*>Timed out</td>')
 Check "S3 onset at first failure" ($st.OutageStartUtc -eq $T0)
 Check "S3 input state not mutated" ($orig.ConsecutiveFailures -eq 0 -and -not $orig.IsDown)
 $dr=Step $st $false $T0.AddSeconds(30) -Result (Res '200' $true 'OK'); $st=$dr.State
-Check "S3 RESOLVED subject exact" ($dr.EmailSubject -eq '[HST RESOLVED] CapCity (HOST1) - outage lasted 00m 30s')
+Check "S3 RESOLVED subject exact" ($dr.EmailSubject -eq '[RESOLVED] eChart at CapCity (HOST1) - outage lasted 00m 30s')
 Check "S3 record fields" ($dr.OutageRecord.DurationSeconds -eq 30 -and $dr.OutageRecord.FailedPolls -eq 3 -and $dr.OutageRecord.RecoveryCode -eq '200' -and $dr.OutageRecord.Duration -eq '00m 30s')
 Check "S3 state fully reset" (-not $st.IsDown -and $st.ConsecutiveFailures -eq 0 -and $null -eq $st.OutageStartUtc -and $null -eq $st.LastAlertUtc)
 
@@ -308,14 +308,14 @@ $st=NewState; for($i=0;$i -lt 3;$i++){ $d=Step $st $true $T0.AddSeconds($i*10); 
 $r1=Step $st $true $T0.AddSeconds(20).AddMinutes(29).AddSeconds(59); $st=$r1.State
 Check "S4 no reminder at 29m59s" ($null -eq $r1.EmailSubject)
 $r2=Step $st $true $T0.AddSeconds(20).AddMinutes(30); $st=$r2.State
-Check "S4 reminder exactly at 30m" ($r2.EmailSubject -like '`[HST STILL DOWN`] CapCity (HOST1) - down for *')
-Check "S4 reminder elapsed counts from onset (30m20s)" ($r2.EmailSubject -eq '[HST STILL DOWN] CapCity (HOST1) - down for 30m 20s')
+Check "S4 reminder exactly at 30m" ($r2.EmailSubject -like '`[STILL DOWN`] eChart at CapCity (HOST1) - down for *')
+Check "S4 reminder elapsed counts from onset (30m20s)" ($r2.EmailSubject -eq '[STILL DOWN] eChart at CapCity (HOST1) - down for 30m 20s')
 $r3=Step $st $true $T0.AddSeconds(20).AddMinutes(31); $st=$r3.State
 Check "S4 no premature second reminder" ($null -eq $r3.EmailSubject)
 $r4=Step $st $true $T0.AddSeconds(20).AddMinutes(60); $st=$r4.State
-Check "S4 second reminder at +60m" ($r4.EmailSubject -like '`[HST STILL DOWN`]*')
+Check "S4 second reminder at +60m" ($r4.EmailSubject -like '`[STILL DOWN`]*')
 $fin=Step $st $false $T0.AddSeconds(20).AddMinutes(61) -Result (Res '200' $true 'OK'); $st=$fin.State
-Check "S4 resolved 1h 01m 20s" ($fin.EmailSubject -eq '[HST RESOLVED] CapCity (HOST1) - outage lasted 1h 01m 20s')
+Check "S4 resolved 1h 01m 20s" ($fin.EmailSubject -eq '[RESOLVED] eChart at CapCity (HOST1) - outage lasted 1h 01m 20s')
 Check "S4 failed polls counted through reminders (7)" ($fin.OutageRecord.FailedPolls -eq 7)
 
 $st=NewState; for($i=0;$i -lt 3;$i++){ $d=Step $st $true $T0.AddSeconds($i*10) -Re 0; $st=$d.State }
@@ -326,9 +326,9 @@ $st=NewState; $d=Step $st $true $T0; $st=$d.State; $d=Step $st $false $T0.AddSec
 Check "S6 flapping onset resets" ($st.OutageStartUtc -eq $T0.AddSeconds(10))
 
 $d=Step (NewState) $true $T0 -Dt 1
-Check "S7 threshold 1 immediate" ($d.EmailSubject -like '`[HST DOWN`]*')
+Check "S7 threshold 1 immediate" ($d.EmailSubject -like '`[DOWN`]*')
 $d=Step (NewState) $true $T0 -Dt 0
-Check "S7 threshold 0 clamps to 1" ($d.EmailSubject -like '`[HST DOWN`]*')
+Check "S7 threshold 0 clamps to 1" ($d.EmailSubject -like '`[DOWN`]*')
 
 $st=NewState; for($i=0;$i -lt 3;$i++){ $d=Step $st $true $T0.AddSeconds($i*10) -Aor $false; $st=$d.State }
 $d=Step $st $false $T0.AddSeconds(30) -Aor $false
@@ -336,7 +336,7 @@ Check "S8 recovery alert off: record yes, email no" ($null -ne $d.OutageRecord -
 
 $st=NewState; for($i=0;$i -lt 3;$i++){ $d=Step $st $true $T0.AddSeconds($i*10); $st=$d.State }
 $d=Step $st $false $T0.AddDays(2).AddHours(3) -Result (Res '200' $true 'OK')
-Check "S9 multi-day duration" ($d.EmailSubject -eq '[HST RESOLVED] CapCity (HOST1) - outage lasted 2d 3h 00m 00s')
+Check "S9 multi-day duration" ($d.EmailSubject -eq '[RESOLVED] eChart at CapCity (HOST1) - outage lasted 2d 3h 00m 00s')
 Check "S9 multi-day seconds" ($d.OutageRecord.DurationSeconds -eq (2*86400+3*3600))
 
 $corrupt = @{ ConsecutiveFailures=2; IsDown=$false; LastAlertUtc=$null; OutageStartUtc=$null; OutageStartLocalStr=$null; OutageStartUtcStr=$null }
@@ -360,7 +360,7 @@ for($k=0;$k -lt 20000;$k++){
   if(-not $f -and $st.ConsecutiveFailures -ne 0){$ok=$false}
   if($st.ConsecutiveFailures -gt 0 -and $null -eq $st.OutageStartUtc){$ok=$false}
   if($d.OutageRecord -and $d.OutageRecord.FailedPolls -lt 3){$ok=$false}
-  if($d.EmailSubject -and -not ($d.EmailSubject -match '^\[HST (DOWN|STILL DOWN|RESOLVED)\] CapCity \(HOST1\) - ')){$ok=$false}
+  if($d.EmailSubject -and -not ($d.EmailSubject -match '^\[(DOWN|STILL DOWN|RESOLVED)\] eChart at CapCity \(HOST1\) - ')){$ok=$false}
 }
 Check "S13 20k-step random soak: invariants hold" $ok
 Check "S13 soak produced outages and records" ($emails -gt 0 -and $records -gt 0)
@@ -368,7 +368,7 @@ Check "S13 soak produced outages and records" ($emails -gt 0 -and $records -gt 0
 Section "E2. Restart notice, heartbeat, delivery tracking, alert queue"
 function Write-Log { param($Level,$Message) $script:LastLog = "$Level|$Message"; $script:Logs += "$Level|$Message" }
 $script:Logs = @()
-$HeartbeatFile = Join-Path $InstallDir 'monitor-heartbeat.json'
+$HeartbeatFile = Join-Path $InstallDir 'heartbeat.json'
 Check "R1 no previous heartbeat -> no notice" ($null -eq (Get-RestartNotice -Previous $null -NowUtc $T0 -GapThresholdSeconds 60 -IntervalSeconds 10 -SiteName 'CapCity' -HostName 'HOST1' -Url 'http://x'))
 Check "R1 missing heartbeat file -> null" ($null -eq (Read-Heartbeat))
 $downState = @{ ConsecutiveFailures=7; IsDown=$true; LastAlertUtc=$T0.AddMinutes(5); OutageStartUtc=$T0; OutageStartLocalStr='2026-09-04 08:00:00'; OutageStartUtcStr='2026-09-04 12:00:00'; AlertDelivered=$false }
@@ -384,10 +384,10 @@ Check "R2 up-state heartbeat has null outage fields" ($hbUp -and -not $hbUp.IsDo
 $n = Get-RestartNotice -Previous $hb -NowUtc $T0.AddMinutes(10).AddSeconds(30) -BootTimeUtc $T0.AddHours(-5) -GapThresholdSeconds 60 -IntervalSeconds 10 -SiteName 'CapCity' -HostName 'HOST1' -Url 'http://x'
 Check "R3 short gap -> no email but the outage is carried over" ($n -and $null -eq $n.Subject -and $n.GapSeconds -eq 30 -and $n.RestoredState -and $n.RestoredState.IsDown -and $n.RestoredState.OutageStartUtc -eq $T0 -and $n.RestoredState.ConsecutiveFailures -eq 7 -and $n.RestoredState.AlertDelivered -eq $false -and $n.RestoredState.LastAlertUtc -eq $T0.AddMinutes(5))
 $n = Get-RestartNotice -Previous $hb -NowUtc $T0.AddMinutes(10).AddSeconds(3840) -BootTimeUtc $T0.AddMinutes(40) -GapThresholdSeconds 60 -IntervalSeconds 10 -SiteName 'CapCity' -HostName 'HOST1' -Url 'http://x'
-Check "R4 long gap after a reboot -> subject names site, server, gap" ($n.Subject -eq '[HST MONITOR RESTARTED] CapCity (HOST1) - not running for 1h 04m 00s')
-Check "R4 body says the server restarted after the heartbeat, outage carried, polls missed" ($n.Body -match '^<html>' -and $n.Body -match 'Server restarted at' -and $n.Body -match 'after the last heartbeat' -and $n.Body -match 'Yes\. HST eChart has been down since 2026-09-04 08:00:00 local' -and $n.Body -match '<td[^>]*>Polls missed</td><td[^>]*>384</td>' -and $n.Body -match '<td[^>]*>Server</td><td[^>]*>HOST1</td>' -and $n.RestoredState.IsDown)
+Check "R4 long gap after a reboot -> subject names site, server, gap" ($n.Subject -eq '[MONITOR RESTARTED] CapCity (HOST1) - not running for 1h 04m 00s')
+Check "R4 body says the server restarted after the heartbeat, outage carried, polls missed" ($n.Body -match '^<html>' -and $n.Body -match 'Server restarted at' -and $n.Body -match 'after the last heartbeat' -and $n.Body -match 'Yes\. It has been down since 2026-09-04 08:00:00 local' -and $n.Body -match '<td[^>]*>Polls missed</td><td[^>]*>384</td>' -and $n.Body -match '<td[^>]*>Server</td><td[^>]*>HOST1</td>' -and $n.RestoredState.IsDown)
 $n = Get-RestartNotice -Previous $hbUp -NowUtc $T0.AddMinutes(10).AddSeconds(90) -BootTimeUtc $T0.AddHours(-5) -GapThresholdSeconds 60 -IntervalSeconds 10 -SiteName 'CapCity' -HostName 'HOST1' -Url 'http://x'
-Check "R5 long gap without a reboot -> process stopped, nothing carried" ($n.Subject -eq '[HST MONITOR RESTARTED] CapCity (HOST1) - not running for 01m 30s' -and $n.Body -match 'Server did not restart' -and $n.Body -match 'None at the last heartbeat' -and $null -eq $n.RestoredState)
+Check "R5 long gap without a reboot -> process stopped, nothing carried" ($n.Subject -eq '[MONITOR RESTARTED] CapCity (HOST1) - not running for 01m 30s' -and $n.Body -match 'Server did not restart' -and $n.Body -match 'None at the last heartbeat' -and $null -eq $n.RestoredState)
 $n = Get-RestartNotice -Previous $hbUp -NowUtc $T0.AddMinutes(5) -BootTimeUtc $T0.AddHours(-5) -GapThresholdSeconds 60 -IntervalSeconds 10 -SiteName 'CapCity' -HostName 'HOST1' -Url 'http://x'
 Check "R6 clock went backwards -> gap zero, no email" ($n -and $null -eq $n.Subject -and $n.GapSeconds -eq 0)
 $n = Get-RestartNotice -Previous $hbUp -NowUtc $T0.AddMinutes(20) -GapThresholdSeconds 60 -IntervalSeconds 10 -SiteName 'CapCity' -HostName 'HOST1' -Url 'http://x'
@@ -411,10 +411,10 @@ Remove-Item $HeartbeatFile -Force
 # Restored state flows through the state machine: first up poll resolves from the original onset and names the undelivered DOWN
 $n = Get-RestartNotice -Previous $hb -NowUtc $T0.AddMinutes(70) -BootTimeUtc $T0.AddMinutes(40) -GapThresholdSeconds 60 -IntervalSeconds 10 -SiteName 'CapCity' -HostName 'HOST1' -Url 'http://x'
 $d = Step $n.RestoredState $false $T0.AddMinutes(70) -Result (Res '200' $true)
-Check "R9 carried-over outage resolves with the true onset and duration" ($d.EmailKind -eq 'Resolved' -and $d.EmailSubject -eq '[HST RESOLVED] CapCity (HOST1) - outage lasted 1h 10m 00s' -and $d.OutageRecord.DurationSeconds -eq 4200 -and $d.OutageRecord.FailedPolls -eq 7 -and $d.OutageRecord.OutageStart_Local -eq '2026-09-04 08:00:00')
+Check "R9 carried-over outage resolves with the true onset and duration" ($d.EmailKind -eq 'Resolved' -and $d.EmailSubject -eq '[RESOLVED] eChart at CapCity (HOST1) - outage lasted 1h 10m 00s' -and $d.OutageRecord.DurationSeconds -eq 4200 -and $d.OutageRecord.FailedPolls -eq 7 -and $d.OutageRecord.OutageStart_Local -eq '2026-09-04 08:00:00')
 Check "R9 RESOLVED says the DOWN alert was never delivered" ($d.EmailBody -match '<td[^>]*>DOWN alert</td><td[^>]*>Not delivered\.' -and $null -eq $d.State.AlertDelivered)
 $d = Step $n.RestoredState $true $T0.AddMinutes(70)
-Check "R9 carried-over outage still down -> reminder from the old onset, first-notice row" ($d.EmailKind -eq 'Reminder' -and $d.EmailSubject -eq '[HST STILL DOWN] CapCity (HOST1) - down for 1h 10m 00s' -and $d.State.ConsecutiveFailures -eq 8 -and $d.EmailBody -match '<td[^>]*>Earlier alerts</td><td[^>]*>Not delivered\.')
+Check "R9 carried-over outage still down -> reminder from the old onset, first-notice row" ($d.EmailKind -eq 'Reminder' -and $d.EmailSubject -eq '[STILL DOWN] eChart at CapCity (HOST1) - down for 1h 10m 00s' -and $d.State.ConsecutiveFailures -eq 8 -and $d.EmailBody -match '<td[^>]*>Earlier alerts</td><td[^>]*>Not delivered\.')
 $deliveredState = $n.RestoredState.Clone(); $deliveredState.AlertDelivered = $true
 $d = Step $deliveredState $false $T0.AddMinutes(70) -Result (Res '200' $true)
 Check "R9 RESOLVED after a delivered DOWN says so" ($d.EmailBody -match '<td[^>]*>DOWN alert</td><td[^>]*>Delivered</td>')
@@ -427,7 +427,7 @@ Check "R10 recovery clears delivery tracking" ($null -eq $d2.State.AlertDelivere
 $script:PendingAlerts = New-Object System.Collections.ArrayList
 $script:SendOk = $false; $script:Sent = @()
 function Send-AlertEmail { param($Subject,$Body) $script:Sent += $Subject; return $script:SendOk }
-$ok = Send-AlertOrQueue -Subject '[HST DOWN] x' -Body 'b' -Kind 'Down'
+$ok = Send-AlertOrQueue -Subject '[DOWN] x' -Body 'b' -Kind 'Down'
 Check "Q1 failed send is queued and reported" (-not $ok -and $script:PendingAlerts.Count -eq 1 -and $script:LastLog -match 'will be retried every minute')
 Check "Q1 retry within a minute does nothing" (@(Send-PendingAlert).Count -eq 0 -and $script:Sent.Count -eq 1)
 $script:PendingAlerts[0].LastUtc = $script:PendingAlerts[0].LastUtc.AddSeconds(-61)
@@ -436,20 +436,20 @@ $script:PendingAlerts[0].LastUtc = $script:PendingAlerts[0].LastUtc.AddSeconds(-
 $k = @(Send-PendingAlert)
 Check "Q1 retry succeeds -> kind returned, queue empty" ($k.Count -eq 1 -and $k[0] -eq 'Down' -and $script:PendingAlerts.Count -eq 0 -and $script:LastLog -match 'Delivered on retry')
 $script:SendOk = $false
-Send-AlertOrQueue -Subject '[HST DOWN] x' -Body 'b' -Kind 'Down' | Out-Null
-Send-AlertOrQueue -Subject '[HST MONITOR RESTARTED] x' -Body 'b' -Kind 'Restart' | Out-Null
-Send-AlertOrQueue -Subject '[HST STILL DOWN] x' -Body 'b' -Kind 'Reminder' | Out-Null
-Check "Q2 reminder supersedes the queued DOWN, restart notice kept" ($script:PendingAlerts.Count -eq 2 -and @($script:PendingAlerts | Where-Object { $_.Kind -eq 'Down' }).Count -eq 0 -and @($script:PendingAlerts | Where-Object { $_.Kind -eq 'Restart' }).Count -eq 1 -and ($script:Logs -join "`n") -match "Dropping undelivered '\[HST DOWN\] x', superseded by '\[HST STILL DOWN\] x'")
-Send-AlertOrQueue -Subject '[HST RESOLVED] x' -Body 'b' -Kind 'Resolved' | Out-Null
+Send-AlertOrQueue -Subject '[DOWN] x' -Body 'b' -Kind 'Down' | Out-Null
+Send-AlertOrQueue -Subject '[MONITOR RESTARTED] x' -Body 'b' -Kind 'Restart' | Out-Null
+Send-AlertOrQueue -Subject '[STILL DOWN] x' -Body 'b' -Kind 'Reminder' | Out-Null
+Check "Q2 reminder supersedes the queued DOWN, restart notice kept" ($script:PendingAlerts.Count -eq 2 -and @($script:PendingAlerts | Where-Object { $_.Kind -eq 'Down' }).Count -eq 0 -and @($script:PendingAlerts | Where-Object { $_.Kind -eq 'Restart' }).Count -eq 1 -and ($script:Logs -join "`n") -match "Dropping undelivered '\[DOWN\] x', superseded by '\[STILL DOWN\] x'")
+Send-AlertOrQueue -Subject '[RESOLVED] x' -Body 'b' -Kind 'Resolved' | Out-Null
 Check "Q2 resolved supersedes the reminder, restart notice kept" ($script:PendingAlerts.Count -eq 2 -and @($script:PendingAlerts | Where-Object { $_.Kind -in @('Down','Reminder') }).Count -eq 0)
-Send-AlertOrQueue -Subject '[HST MONITOR RESTARTED] y' -Body 'b' -Kind 'Restart' | Out-Null
-Check "Q2 a newer restart notice replaces the older one" (@($script:PendingAlerts | Where-Object { $_.Kind -eq 'Restart' }).Count -eq 1 -and $script:PendingAlerts[-1].Subject -eq '[HST MONITOR RESTARTED] y')
+Send-AlertOrQueue -Subject '[MONITOR RESTARTED] y' -Body 'b' -Kind 'Restart' | Out-Null
+Check "Q2 a newer restart notice replaces the older one" (@($script:PendingAlerts | Where-Object { $_.Kind -eq 'Restart' }).Count -eq 1 -and $script:PendingAlerts[-1].Subject -eq '[MONITOR RESTARTED] y')
 foreach ($item in $script:PendingAlerts) { $item.FirstUtc = $item.FirstUtc.AddMinutes(-61); $item.LastUtc = $item.LastUtc.AddSeconds(-61) }
 $k = @(Send-PendingAlert)
-Check "Q3 gives up after an hour of failures" ($k.Count -eq 0 -and $script:PendingAlerts.Count -eq 0 -and ($script:Logs -join "`n") -match "Giving up on '\[HST RESOLVED\] x' after 60 minutes")
+Check "Q3 gives up after an hour of failures" ($k.Count -eq 0 -and $script:PendingAlerts.Count -eq 0 -and ($script:Logs -join "`n") -match "Giving up on '\[RESOLVED\] x' after 60 minutes")
 $script:SendOk = $false
-1..7 | ForEach-Object { Send-AlertOrQueue -Subject "[HST DOWN] $_" -Body 'b' -Kind "K$_" | Out-Null }
-Check "Q4 queue is capped at 5, oldest dropped" ($script:PendingAlerts.Count -eq 5 -and $script:PendingAlerts[0].Subject -eq '[HST DOWN] 3')
+1..7 | ForEach-Object { Send-AlertOrQueue -Subject "[DOWN] $_" -Body 'b' -Kind "K$_" | Out-Null }
+Check "Q4 queue is capped at 5, oldest dropped" ($script:PendingAlerts.Count -eq 5 -and $script:PendingAlerts[0].Subject -eq '[DOWN] 3')
 $script:PendingAlerts.Clear()
 $script:SendOk = $true
 Check "Q5 successful send is never queued" ((Send-AlertOrQueue -Subject 's' -Body 'b' -Kind 'Down') -and $script:PendingAlerts.Count -eq 0)
@@ -478,7 +478,7 @@ Check "Monitor writes a heartbeat before and after each poll" (([regex]::Matches
 Check "Monitor waits for name resolution before its first poll" ($template -match 'Wait-NetworkReady -Url \$Url')
 Check "Monitor restart notice threshold is at least 60 s" ($template -match '\[math\]::Max\(60, 2 \* \(\$IntervalSeconds \+ \$TimeoutSeconds\)\)')
 Check "Monitor Graph calls have a 30 s timeout" (([regex]::Matches($template, '-TimeoutSec 30')).Count -eq 2)
-Check "Installer marks the heartbeat as a deliberate stop and logs STOP to the drops log" ($src -match "(?s)elseif \(\`$wasRunning\) \{.*?Add-Member -NotePropertyName Stopped -NotePropertyValue \`$true.*?HST-eChart-Drops\.log.*?'STOP'")
+Check "Installer marks the heartbeat as a deliberate stop and logs STOP to the drops log" ($src -match "(?s)elseif \(\`$wasRunning\) \{.*?Add-Member -NotePropertyName Stopped -NotePropertyValue \`$true.*?Drops\.log.*?'STOP'")
 Check "Probe cycle errors reach the drops log" ($template.Contains("Write-DropLog -Kind 'ERROR' -Message `"Probe cycle error"))
 Check "Install email skipped when the SMTP password cannot be read back" ($src -match '\$canSend -and \(Send-MailWithConfig')
 Check "Stored secret gated on the credential recorded at the last successful install" ($src -match "\`$Saved\.CredentialFor -eq \`$client\) \{ Get-StoredSecret \}" -and $src -match "\`$settings\['CredentialFor'\] = switch")
@@ -494,7 +494,7 @@ function RunSlow {
     foreach ($q in $Polls) {
         $now = $Start.AddSeconds($i * $Spacing)
         $res = if ($q.F) { SlowRes $null ("P{0:000}" -f $i) '000' 'Timed out' } else { SlowRes $q.Ms ("P{0:000}" -f $i) }
-        $d = Update-SlowState -State $st -Result $res -Failed ([bool]$q.F) -IsDown ([bool]$q.D) -NowUtc $now -SlowThresholdMs 3000 -WindowMinutes 5 -AlertPercent 50 -ClearPercent 10 -ReAlertMinutes $Re -AlertOnRecovery $Aor -SiteName 'CapCity' -Url 'http://x' -HostName 'HOST1'
+        $d = Update-SlowState -State $st -Result $res -Failed ([bool]$q.F) -IsDown ([bool]$q.D) -NowUtc $now -SlowThresholdMs 3000 -WindowMinutes 5 -AlertPercent 50 -ClearPercent 10 -ReAlertMinutes $Re -AlertOnRecovery $Aor -SiteName 'CapCity' -Url 'http://x' -HostName 'HOST1' -MonitorName 'eChart'
         $st = $d.State
         [void]$steps.Add([PSCustomObject]@{ I = $i; Now = $now; D = $d })
         $i++
@@ -516,14 +516,14 @@ $r = RunSlow -State (NewSlow) -Polls $seq -Start $T0
 $kinds = @($r.Emails | ForEach-Object { "$($_.I):$($_.D.EmailKind)" })
 Check "SL3 sustained slowness: exactly SLOW, STILL SLOW, SLOW RESOLVED in that order" (($kinds -join ',') -eq '29:Slow,149:SlowReminder,177:SlowResolved')
 $e = $r.Steps[29].D
-Check "SL3 SLOW when half the 5 min window is slow, subject counts polls" ($e.EmailSubject -eq '[HST SLOW] CapCity (HOST1) - 10 of 20 polls slow or failed in 5 min' -and $e.DropKind -eq 'SLOWSTART' -and $e.State.StartLocalStr -eq 'P020' -and $e.State.StartUtc -eq $T0.AddSeconds(300))
+Check "SL3 SLOW when half the 5 min window is slow, subject counts polls" ($e.EmailSubject -eq '[SLOW] eChart at CapCity (HOST1) - 10 of 20 polls slow or failed in 5 min' -and $e.DropKind -eq 'SLOWSTART' -and $e.State.StartLocalStr -eq 'P020' -and $e.State.StartUtc -eq $T0.AddSeconds(300))
 Check "SL3 SLOW body: HTML table with window counts, timing, clear rule, server" ($e.EmailBody -match '^<html>' -and $e.EmailBody -match '<td[^>]*>Last 5 min</td><td[^>]*>20 polls in 5 min: 10 slower than 3000 ms, 0 failed</td>' -and $e.EmailBody -match 'median \d+ ms, worst 4500 ms' -and $e.EmailBody -match '<td[^>]*>Server</td><td[^>]*>HOST1</td>' -and $e.EmailBody -match '10% or fewer')
 Check "SL3 log line for the drops log" ($e.TransitionLog -eq 'Declared SLOW for CapCity: 20 polls in 5 min: 10 slower than 3000 ms, 0 failed (median 300 ms, worst 4500 ms).')
 $e = $r.Steps[149].D
-Check "SL3 STILL SLOW after 30 min with elapsed since the first slow poll" ($e.EmailSubject -eq "[HST STILL SLOW] CapCity (HOST1) - slow for $(Format-Duration ([TimeSpan]::FromSeconds(149 * 15 - 300)))" -and $e.DropKind -eq 'SLOWSTILL')
+Check "SL3 STILL SLOW after 30 min with elapsed since the first slow poll" ($e.EmailSubject -eq "[STILL SLOW] eChart at CapCity (HOST1) - slow for $(Format-Duration ([TimeSpan]::FromSeconds(149 * 15 - 300)))" -and $e.DropKind -eq 'SLOWSTILL')
 Check "SL3 hysteresis: still slow at 40 percent, no email" ($r.Steps[171].D.State.IsSlow -and $null -eq $r.Steps[171].D.EmailSubject)
 $e = $r.Steps[177].D
-Check "SL3 SLOW RESOLVED once the share is 10 percent, timed from the first good poll after the last slow one" ($e.EmailSubject -eq "[HST SLOW RESOLVED] CapCity (HOST1) - slow period lasted $(Format-Duration ([TimeSpan]::FromSeconds(160 * 15 - 300)))" -and $e.DropKind -eq 'SLOWCLEAR' -and $e.EmailBody -match '<td[^>]*>Normal from</td><td[^>]*>P160 local</td>' -and $e.EmailBody -match "<td[^>]*>Duration</td><td[^>]*>$(Format-Duration ([TimeSpan]::FromSeconds(2100)))</td>" -and $e.EmailBody -match '<td[^>]*>Polls while slow</td><td[^>]*>150: 140 slower than 3000 ms, 0 failed</td>' -and $e.EmailBody -match '<td[^>]*>Worst response</td><td[^>]*>9001 ms</td>' -and $e.TransitionLog -match 'lasted 35m 00s, 150 polls, 140 slow, 0 failed, worst 9001 ms\.$')
+Check "SL3 SLOW RESOLVED once the share is 10 percent, timed from the first good poll after the last slow one" ($e.EmailSubject -eq "[SLOW RESOLVED] eChart at CapCity (HOST1) - slow period lasted $(Format-Duration ([TimeSpan]::FromSeconds(160 * 15 - 300)))" -and $e.DropKind -eq 'SLOWCLEAR' -and $e.EmailBody -match '<td[^>]*>Normal from</td><td[^>]*>P160 local</td>' -and $e.EmailBody -match "<td[^>]*>Duration</td><td[^>]*>$(Format-Duration ([TimeSpan]::FromSeconds(2100)))</td>" -and $e.EmailBody -match '<td[^>]*>Polls while slow</td><td[^>]*>140: 140 slower than 3000 ms, 0 failed</td>' -and $e.EmailBody -match '<td[^>]*>Worst response</td><td[^>]*>9001 ms</td>' -and $e.TransitionLog -match 'lasted 35m 00s, 140 polls, 140 slow, 0 failed, worst 9001 ms\.$')
 Check "SL3 state reset after resolution" (-not $e.State.IsSlow -and $null -eq $e.State.StartUtc -and $e.State.Polls -eq 0 -and $e.State.WorstMs -eq 0)
 Check "SL3 SLOW RESOLVED says whether the SLOW email was delivered" ($e.EmailBody -match '<td[^>]*>SLOW alert</td><td[^>]*>Not delivered')
 
@@ -552,7 +552,7 @@ Check "SL8 pure: the caller's state and window are not changed" (@($orig.Samples
 function NewCarried { $c = NewSlow; $c.IsSlow = $true; $c.StartUtc = $T0; $c.StartLocalStr = '2026-09-04 08:00:00'; $c.LastAlertUtc = $T0.AddMinutes(1); $c.Polls = 40; $c.SlowPolls = 30; $c.WorstMs = 7000; $c.AlertDelivered = $true; $c }
 $r = RunSlow -State (NewCarried) -Polls (Rep (Pl 250) 12) -Start $T0.AddMinutes(20)
 $e = @($r.Emails)[0]
-Check "SL9 carried-over slow period waits for half the window, then resolves at the 11th fast poll with its true start" ($r.Emails.Count -eq 1 -and $e.I -eq 10 -and $e.D.EmailKind -eq 'SlowResolved' -and $e.D.EmailSubject -eq '[HST SLOW RESOLVED] CapCity (HOST1) - slow period lasted 20m 00s' -and $e.D.EmailBody -match '<td[^>]*>Slow from</td><td[^>]*>2026-09-04 08:00:00 local</td>' -and $e.D.EmailBody -match '<td[^>]*>Normal from</td><td[^>]*>P000 local</td>' -and $e.D.EmailBody -match '40: 30 slower than 3000 ms' -and $e.D.EmailBody -match '<td[^>]*>SLOW alert</td><td[^>]*>Delivered</td>')
+Check "SL9 carried-over slow period waits for half the window, then resolves at the 11th fast poll with its true start" ($r.Emails.Count -eq 1 -and $e.I -eq 10 -and $e.D.EmailKind -eq 'SlowResolved' -and $e.D.EmailSubject -eq '[SLOW RESOLVED] eChart at CapCity (HOST1) - slow period lasted 20m 00s' -and $e.D.EmailBody -match '<td[^>]*>Slow from</td><td[^>]*>2026-09-04 08:00:00 local</td>' -and $e.D.EmailBody -match '<td[^>]*>Normal from</td><td[^>]*>P000 local</td>' -and $e.D.EmailBody -match '40: 30 slower than 3000 ms' -and $e.D.EmailBody -match '<td[^>]*>SLOW alert</td><td[^>]*>Delivered</td>')
 $stillSlow = @(); for ($i = 0; $i -lt 40; $i++) { $stillSlow += $(if ($i % 3 -eq 0) { Pl 300 } else { Pl 4500 }) }
 $r = RunSlow -State (NewCarried) -Polls $stillSlow -Start $T0.AddMinutes(20)
 Check "SL9 carried-over period that is still slow: no SLOW RESOLVED and no second SLOW over 10 minutes, even with a fast first poll" ($r.Emails.Count -eq 0 -and $r.State.IsSlow -and $r.State.StartUtc -eq $T0)
@@ -573,14 +573,14 @@ Write-Heartbeat -State $upState -NowUtc $T0.AddMinutes(11)
 Check "SL10 heartbeat without a slow state reads back as not slow" (-not (Read-Heartbeat).IsSlow)
 
 $script:PendingAlerts = New-Object System.Collections.ArrayList; $script:SendOk = $false
-Send-AlertOrQueue -Subject '[HST SLOW] a' -Body 'b' -Kind 'Slow' | Out-Null
-Send-AlertOrQueue -Subject '[HST DAILY] a' -Body 'b' -Kind 'Summary' | Out-Null
-Send-AlertOrQueue -Subject '[HST SLOW RESOLVED] a' -Body 'b' -Kind 'SlowResolved' | Out-Null
+Send-AlertOrQueue -Subject '[SLOW] a' -Body 'b' -Kind 'Slow' | Out-Null
+Send-AlertOrQueue -Subject '[DAILY] a' -Body 'b' -Kind 'Summary' | Out-Null
+Send-AlertOrQueue -Subject '[SLOW RESOLVED] a' -Body 'b' -Kind 'SlowResolved' | Out-Null
 Check "SL11 SLOW RESOLVED supersedes an undelivered SLOW" (@($script:PendingAlerts | Where-Object { $_.Kind -eq 'Slow' }).Count -eq 0 -and @($script:PendingAlerts | Where-Object { $_.Kind -eq 'SlowResolved' }).Count -eq 1)
-Send-AlertOrQueue -Subject '[HST SLOW] b' -Body 'b' -Kind 'Slow' | Out-Null
-Send-AlertOrQueue -Subject '[HST DOWN] b' -Body 'b' -Kind 'Down' | Out-Null
-Send-AlertOrQueue -Subject '[HST DAILY] b' -Body 'b' -Kind 'Summary' | Out-Null
-Check "SL11 DOWN supersedes an undelivered SLOW, a newer summary replaces the older one" (@($script:PendingAlerts | Where-Object { $_.Kind -eq 'Slow' }).Count -eq 0 -and @($script:PendingAlerts | Where-Object { $_.Kind -eq 'Summary' }).Count -eq 1 -and @($script:PendingAlerts | Where-Object { $_.Kind -eq 'Summary' })[0].Subject -eq '[HST DAILY] b')
+Send-AlertOrQueue -Subject '[SLOW] b' -Body 'b' -Kind 'Slow' | Out-Null
+Send-AlertOrQueue -Subject '[DOWN] b' -Body 'b' -Kind 'Down' | Out-Null
+Send-AlertOrQueue -Subject '[DAILY] b' -Body 'b' -Kind 'Summary' | Out-Null
+Check "SL11 DOWN supersedes an undelivered SLOW, a newer summary replaces the older one" (@($script:PendingAlerts | Where-Object { $_.Kind -eq 'Slow' }).Count -eq 0 -and @($script:PendingAlerts | Where-Object { $_.Kind -eq 'Summary' }).Count -eq 1 -and @($script:PendingAlerts | Where-Object { $_.Kind -eq 'Summary' })[0].Subject -eq '[DAILY] b')
 $script:PendingAlerts.Clear(); $script:SendOk = $true
 
 $d7 = [datetime]'2026-09-15T07:00:00'
@@ -594,7 +594,7 @@ $lines = @(
     '2026-09-15 06:16:49 | SLOW      | Site=CapCity Code=200 Redirects=2 TTFB=8891ms Total=9001ms Populated=True IP=98.91.165.173 Reason=OK',
     '2026-09-15 06:18:49 | SLOW      | Site=CapCity Code=200 Redirects=2 TTFB=4303ms Total=4322ms Populated=True IP=184.73.88.34 Reason=OK',
     '2026-09-15 06:18:50 | SLOWSTART | Declared SLOW for CapCity: 20 polls in 5 min.',
-    '2026-09-15 06:18:50 | ALERT     | Sent: [HST SLOW] CapCity (HOST1) - 10 of 20 polls slow or failed in 5 min',
+    '2026-09-15 06:18:50 | ALERT     | Sent: [SLOW] eChart at CapCity (HOST1) - 10 of 20 polls slow or failed in 5 min',
     '2026-09-15 06:53:07 | FAIL      | Site=CapCity Code=000 Redirects=0 TTFB=15013ms Total=15013ms Populated=False IP= Reason=Timed out',
     '2026-09-15 06:55:00 | FAIL      | Site=CapCity Code=503 Redirects=2 TTFB=40ms Total=41ms Populated=False IP=1.2.3.4 Reason=HTTP 503',
     '2026-09-15 06:55:10 | DOWN      | Declared DOWN for CapCity after 3 consecutive failures (HTTP 503).',
@@ -604,7 +604,7 @@ $lines = @(
     '2026-09-15 07:00:01 | FAIL      | Site=CapCity Code=000 Reason=Timed out'
 )
 $sum = Get-DailySummary -Lines $lines -NowLocal $d7 -SlowThresholdMs 3000 -SiteName 'CapCity' -HostName 'HOST1' -Url 'http://x'
-Check "DS2 summary counts only the 24 hours before the send, subject reads naturally" ($sum -and $sum.Subject -eq '[HST DAILY] CapCity (HOST1) - 3 slow polls, 2 failed polls, 1 outage in 24 hours' -and $sum.SlowPolls -eq 3 -and $sum.FailedPolls -eq 2 -and $sum.Outages -eq 1 -and $sum.SlowPeriods -eq 1 -and $sum.WorstMs -eq 9001)
+Check "DS2 summary counts only the 24 hours before the send, subject reads naturally" ($sum -and $sum.Subject -eq '[DAILY] CapCity (HOST1) - 3 slow polls, 2 failed polls, 1 outage in 24 hours' -and $sum.SlowPolls -eq 3 -and $sum.FailedPolls -eq 2 -and $sum.Outages -eq 1 -and $sum.SlowPeriods -eq 1 -and $sum.WorstMs -eq 9001)
 Check "DS2 summary body: worst response, failure reasons, outage length, busiest hour, restarts" ($sum.Body -match '<td[^>]*>Slow polls</td><td[^>]*>3 slower than 3000 ms, worst 9001 ms</td>' -and $sum.Body -match '<td[^>]*>Failed polls</td><td[^>]*>2 \((Timed out x1, HTTP 503 x1|HTTP 503 x1, Timed out x1)\)</td>' -and $sum.Body -match '<td[^>]*>Outages</td><td[^>]*>1, lasting 02m 10s</td>' -and $sum.Body -match '<td[^>]*>Busiest hour</td><td[^>]*>06:00 to 06:59, 5 slow or failed polls</td>' -and $sum.Body -match '<td[^>]*>Monitor restarts</td><td[^>]*>1</td>' -and $sum.Body -match '<td[^>]*>Server</td><td[^>]*>HOST1</td>')
 Check "DS3 nothing went wrong: no summary" ($null -eq (Get-DailySummary -Lines @('2026-09-15 06:00:00 | START     | x', '2026-09-15 06:30:00 | ALERT     | Sent: y', '2026-09-15 06:40:00 | STOP      | z') -NowLocal $d7 -SiteName 'CapCity' -HostName 'HOST1') -and $null -eq (Get-DailySummary -Lines @() -NowLocal $d7 -SiteName 'CapCity' -HostName 'HOST1'))
 $ongoing = Get-DailySummary -Lines @('2026-09-14 06:00:00 | DOWN      | Declared DOWN for CapCity after 3 consecutive failures (Timed out).', '2026-09-15 06:30:00 | REMINDER  | Reminder raised for CapCity, down for 24h 30m.', '2026-09-15 06:40:00 | FAIL      | Site=CapCity Code=000 Reason=Timed out') -NowLocal $d7 -SiteName 'CapCity' -HostName 'HOST1'
@@ -614,10 +614,10 @@ Check "DS6 an outage that crossed the start of the window counts once with its l
 $carriedOut = Get-DailySummary -Lines @('2026-09-15 05:00:00 | CARRYOVER | Outage in progress since 2026-09-14 05:00:00 local carried over from before the restart (40 failed polls so far).', '2026-09-15 05:10:00 | CARRYOVER | Slow period since 2026-09-15 04:55:00 local carried over from before the restart.', '2026-09-15 05:20:00 | RESOLVED  | Outage record written: CapCity lasted 24h 20m 00s over 900 failed polls. Recovery HTTP 200 from 1.2.3.4.') -NowLocal $d7 -SiteName 'CapCity' -HostName 'HOST1'
 Check "DS6 an outage carried over a restart counts once, a carried slow period is not an outage" ($carriedOut.Outages -eq 1 -and $carriedOut.Body -match '<td[^>]*>Outages</td><td[^>]*>1, lasting 24h 20m 00s</td>')
 $one = Get-DailySummary -Lines @('2026-09-15 06:53:07 | FAIL      | Site=CapCity Code=000 Reason=Timed out') -NowLocal $d7 -SiteName 'CapCity' -HostName 'HOST1'
-Check "DS4 a single timeout is enough for a summary, singular wording" ($one.Subject -eq '[HST DAILY] CapCity (HOST1) - 0 slow polls, 1 failed poll, 0 outages in 24 hours' -and $one.Body -match '<td[^>]*>Slow polls</td><td[^>]*>None</td>')
+Check "DS4 a single timeout is enough for a summary, singular wording" ($one.Subject -eq '[DAILY] CapCity (HOST1) - 0 slow polls, 1 failed poll, 0 outages in 24 hours' -and $one.Body -match '<td[^>]*>Slow polls</td><td[^>]*>None</td>')
 
 $genSlow = New-MonitorContent -SiteName 'S' -Mail $mRelay
-Check "SL12 generated monitor bakes the slow alert and summary settings" ($genSlow -match '(?m)^\$AlertOnSlow\s+=\s+\$true$' -and $genSlow -match '(?m)^\$SlowWindowMinutes\s+=\s+5$' -and $genSlow -match '(?m)^\$SlowAlertPercent\s+=\s+50$' -and $genSlow -match '(?m)^\$SlowClearPercent\s+=\s+10$' -and $genSlow -match '(?m)^\$DailySummaryHour\s+=\s+7$' -and $genSlow -match "(?m)^\`$SummaryStateFile\s+=\s+'.*\\daily-summary-sent\.txt'$")
+Check "SL12 generated monitor bakes the slow alert and summary settings" ($genSlow -match '(?m)^\$AlertOnSlow\s+=\s+\$true$' -and $genSlow -match '(?m)^\$SlowWindowMinutes\s+=\s+5$' -and $genSlow -match '(?m)^\$SlowAlertPercent\s+=\s+50$' -and $genSlow -match '(?m)^\$SlowClearPercent\s+=\s+10$' -and $genSlow -match '(?m)^\$DailySummaryHour\s+=\s+7$' -and $genSlow -match "(?m)^\`$SummaryStateFile\s+=\s+'.*\\summary-sent\.txt'$")
 $saveSlow = @($AlertOnSlow, $SlowWindowMinutes, $SlowAlertPercent, $SlowClearPercent, $DailySummaryHour)
 $AlertOnSlow = $false; $SlowWindowMinutes = 0; $SlowAlertPercent = 5; $SlowClearPercent = 20; $DailySummaryHour = 30
 $genClamp = New-MonitorContent -SiteName 'S' -Mail $mRelay
@@ -635,7 +635,7 @@ Check "SL13 installer summary and install email describe the alert rules" ($src 
 Section "F. Live probe via curl.exe shim"
 $SiteName='T'; $ExpectedContentMarker=''; $MinPopulatedBytes=100; $TimeoutSeconds=10
 $Url='https://raw.githubusercontent.com/PowerShell/PowerShell/master/README.md'
-$p=Get-HSTProbeResult
+$p=Get-ProbeResult
 Check "Probe healthy 200"          ($p.HttpCode -eq '200')
 Check "Probe healthy exit 0 / OK"  ($p.CurlExit -eq 0 -and $p.Reason -eq 'OK')
 Check "Probe timings numeric"      ($null -ne $p.TotalMs -and $null -ne $p.TtfbMs -and $null -ne $p.DnsMs)
@@ -643,39 +643,39 @@ Check "Probe IP + size"            (-not [string]::IsNullOrWhiteSpace($p.RemoteI
 Check "Probe populated"            ($p.ContentOk)
 Check "Probe classified UP"        (-not (($p.CurlExit -ne 0) -or ($p.HttpCode -ne '200') -or (-not $p.ContentOk) -or ($null -eq $p.TotalMs)))
 $Url='http://127.0.0.1:9/'; $TimeoutSeconds=3
-$p=Get-HSTProbeResult
+$p=Get-ProbeResult
 Check "Refused: code 000"          ($p.HttpCode -eq '000')
 Check "Refused: exit 7 reason"     ($p.CurlExit -eq 7 -and $p.Reason -eq 'Connection refused or unreachable')
 Check "Refused: classified DOWN"   (($p.CurlExit -ne 0) -or ($p.HttpCode -ne '200') -or (-not $p.ContentOk) -or ($null -eq $p.TotalMs))
 $Url='http://nonexistent-host-zz.invalid/'
-$p=Get-HSTProbeResult
+$p=Get-ProbeResult
 Check "DNS fail: exit 6"           ($p.CurlExit -eq 6 -and $p.Reason -eq 'DNS resolution failed')
 Check "DNS fail: code 000"         ($p.HttpCode -eq '000')
 $Url='http://192.0.2.1/'; $TimeoutSeconds=2
-$p=Get-HSTProbeResult
+$p=Get-ProbeResult
 Check "Blackhole: non-zero curl exit" ($p.CurlExit -ne 0)
 Check "Blackhole: classified DOWN" (($p.CurlExit -ne 0) -or ($p.HttpCode -ne '200') -or (-not $p.ContentOk) -or ($null -eq $p.TotalMs))
 Check "No probe body file left behind" (-not (Test-Path (Join-Path $InstallDir 'probe-body.tmp')))
 $Url='https://raw.githubusercontent.com/PowerShell/PowerShell/master/README.md'; $TimeoutSeconds=10
-$ExpectedContentMarker='PowerShell'; $p=Get-HSTProbeResult
+$ExpectedContentMarker='PowerShell'; $p=Get-ProbeResult
 Check "Marker present -> populated" ($p.ContentOk)
-$ExpectedContentMarker='zzz-not-in-page-zzz'; $p=Get-HSTProbeResult
+$ExpectedContentMarker='zzz-not-in-page-zzz'; $p=Get-ProbeResult
 Check "Marker absent -> not populated -> DOWN with a reason that says so" (-not $p.ContentOk -and $p.Reason -match '^Page not populated \(\d+ bytes, marker missing\)$')
-$ExpectedContentMarker='PowerShell'; $MinPopulatedBytes=10000000; $p=Get-HSTProbeResult
+$ExpectedContentMarker='PowerShell'; $MinPopulatedBytes=10000000; $p=Get-ProbeResult
 Check "Marker present but body too small -> not populated, reason says marker found" (-not $p.ContentOk -and $p.Reason -match '^Page not populated \(\d+ bytes, marker found\)$')
 
 # The real endpoint with the installer defaults: two redirects land on the federation sign-in page
 $Url='https://prodasp09.hstpathways.com/p95_CSP/HSTeChart'; $TimeoutSeconds=15; $MaxRedirects=5; $MinPopulatedBytes=1000; $ExpectedContentMarker='HST Federation Provider'
-$p=Get-HSTProbeResult
+$p=Get-ProbeResult
 Check "Live HST: 200 after following redirects" ($p.HttpCode -eq '200' -and $p.CurlExit -eq 0 -and $p.Reason -eq 'OK')
 Check "Live HST: exactly 2 redirects to the federation sign-in page" ($p.Redirects -eq '2' -and $p.FinalUrl -match '^https://prodasp09\.hstpathways\.com/p95_CSP/HSTFederationProvider/')
 Check "Live HST: redirect time captured and below total" ($null -ne $p.RedirectMs -and $p.RedirectMs -gt 0 -and $p.RedirectMs -le $p.TotalMs)
 Check "Live HST: sign-in page populated (marker and size)" ($p.ContentOk -and [int]$p.SizeBytes -ge 1000)
 Check "Live HST: classified UP" (-not (($p.CurlExit -ne 0) -or ($p.HttpCode -ne '200') -or (-not $p.ContentOk) -or ($null -eq $p.TotalMs)))
-$MaxRedirects=0; $p=Get-HSTProbeResult
+$MaxRedirects=0; $p=Get-ProbeResult
 Check "Redirect cap hit: exit 47, last code 302, classified DOWN" ($p.CurlExit -eq 47 -and $p.Reason -eq 'Too many redirects' -and $p.HttpCode -eq '302' -and (($p.HttpCode -ne '200') -or (-not $p.ContentOk)))
 $MaxRedirects=0; $Url='https://prodasp09.hstpathways.com/p95_CSP/HSTeChart/'; $TimeoutSeconds=15
-$p=Get-HSTProbeResult
+$p=Get-ProbeResult
 $MaxRedirects=5
 Check "Clean non-200 without a curl error names the HTTP code as the reason" ($p.CurlExit -eq 47 -or ($p.CurlExit -eq 0 -and $p.Reason -eq "HTTP $($p.HttpCode)"))
 $MaxRedirects=5; $ExpectedContentMarker=''; $MinPopulatedBytes=100
@@ -719,7 +719,7 @@ Check "W1 Graph existing app returns config" ($m.MailMethod -eq 'Graph' -and $m.
 Check "W1 secret passed to test send" ($script:LastGraphSecret -eq 's3cret')
 Check "W1 pasted secret reaches Protect-Secret as text" ($script:LastPlainText -eq 's3cret')
 Check "W1 exactly 9 prompts" ($script:PromptCount -eq 9)
-Check "W1 test subject names site and server" ($script:SentSubjects[-1] -eq "[HST MONITOR TEST] S ($env:COMPUTERNAME)")
+Check "W1 test subject names site and server" ($script:SentSubjects[-1] -eq "[MONITOR TEST] S ($env:COMPUTERNAME)")
 
 # W2 Graph re-run with saved settings: all Enter except secret
 $saved = [PSCustomObject]@{ MailMethod='Graph'; SmtpServer='graph.microsoft.com'; SmtpPort=443; SmtpUseSsl=$true; MailFrom='hst@contoso.com'; MailTo=@('a@contoso.com','b@contoso.com'); SmtpAuthUser=''; GraphTenantId=$T; GraphClientId=$C; GraphSecretExpires='2028-01-01'; CredentialFor=$C }
@@ -959,7 +959,7 @@ Check "Web error bodies surfaced in installer and monitor" ((([regex]::Matches($
 Check "Access-denied hint explains the propagation wait" ($src -match 'Wait at least 30 minutes without retrying')
 Check "First-site Graph test send auto-waits only for an Exchange access denial" ($src -match "\`$method -eq 'Graph' -and \`$script:LastGraphSendError -eq 'AccessDenied' -and \(\`$created -or" -and $src -match 'wait and retry automatically')
 Check "Ports validated through Read-PortSetting" ($src -match 'function Read-PortSetting' -and -not ($src -match '\[int\]\(Read-Setting -Prompt "Port"'))
-Check "Install folder hardened before anything is written" ($src -match 'function Protect-InstallFolder' -and $src -match "Protect-InstallFolder -Path \`$InstallDir\s*\r?\n" -and $src -match "Protect-InstallFolder -Path \(Split-Path -Path \`$InstallDir -Parent\) -OwnerOnly")
+Check "Install root and monitor folder hardened before anything is written" ($src -match 'function Protect-InstallFolder' -and $src -match "Protect-InstallFolder -Path \`$InstallDir\s*\r?\n" -and $src -match "Protect-InstallFolder -Path \`$InstallRoot\s*\r?\n" -and $src -match "Protect-InstallFolder -Path \(Split-Path -Path \`$InstallRoot -Parent\) -OwnerOnly")
 Check "Credential file restricted before content is written, icacls checked" ($src -match "(?s)function Save-SmtpCredential \{.*?icacls\.exe.*?LASTEXITCODE.*?Set-Content.*?\n\}")
 Check "Exchange not-found mapping is narrow and transient errors retried" ($src -match "couldn\.t be found\|could not be found" -and $src -match '429, 500, 502, 503, 504')
 Check "Stale role assignment replaced instead of trusted by name" ($src -match "Remove-ManagementRoleAssignment")
@@ -1239,6 +1239,210 @@ function Get-Mailbox { param($Identity,$ErrorAction) if ($Identity -like 'missin
 $script:ExoMode='module'
 Check "Dispatch module: calls local cmdlet with splat" (((Invoke-ExoCmdlet -Name 'Get-Mailbox' -Parameters @{ Identity='x@contoso.com' })[0]).Via -eq 'module')
 Check "Dispatch module: not-found swallowed" ($null -eq (Invoke-ExoCmdlet -Name 'Get-Mailbox' -Parameters @{ Identity='missing@contoso.com' } -NullOnNotFound))
+
+
+Section "K. Monitor name, URL, content marker, and migration from the older install"
+foreach ($f in $ast.FindAll({param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst]},$false) | Where-Object { $_.Name -in @('ConvertTo-MonitorSlug','Test-MonitorUrl','Get-MonitorName','Get-MonitorUrl','Get-ContentMarker','Get-InstalledMonitor','Get-LegacyInstall','Invoke-LegacyMigration','Get-SlugClash','Test-MonitorNameLength','Protect-StoredSecret') }) { Invoke-Expression $f.Extent.Text }
+$NonInteractive = $false; $MonitorNameOverride = ''; $Url = ''; $ExpectedContentMarker = ''
+function Write-Log { param($Level,$Message) $script:LastLog = "$Level|$Message"; $script:Logs += "$Level|$Message" }
+$script:Logs = @()
+$kRoot = '/tmp/curlmon_test'
+if (Test-Path $kRoot) { Remove-Item $kRoot -Recurse -Force }
+New-Item $kRoot -ItemType Directory | Out-Null
+$InstallRoot = $kRoot
+
+Check "K1 slug keeps letters and digits, collapses the rest, trims dashes" ((ConvertTo-MonitorSlug 'HST eChart') -eq 'HST-eChart' -and (ConvertTo-MonitorSlug '  --HST  eChart!!  ') -eq 'HST-eChart' -and (ConvertTo-MonitorSlug 'Portal (prod) / v2') -eq 'Portal-prod-v2' -and (ConvertTo-MonitorSlug '***') -eq '' -and (ConvertTo-MonitorSlug $null) -eq '')
+Check "K1 slug stays inside a sensible folder length" (((ConvertTo-MonitorSlug ('a' * 200)).Length -le 60) -and -not ((ConvertTo-MonitorSlug ('a' * 200)).EndsWith('-')))
+Check "K2 URL check takes http and https only" ((Test-MonitorUrl 'https://example.com/x') -and (Test-MonitorUrl 'http://10.0.0.5:8080/health') -and -not (Test-MonitorUrl 'example.com') -and -not (Test-MonitorUrl 'ftp://example.com') -and -not (Test-MonitorUrl '') -and -not (Test-MonitorUrl 'not a url'))
+
+Push @('', 'not-a-url', 'ftp://x.example', 'https://portal.example.com/health')
+$u = Get-MonitorUrl -SavedDefault ''
+Check "K2 prompt refuses anything that is not an http URL and keeps asking" ($u -eq 'https://portal.example.com/health' -and $script:PromptCount -eq 4)
+Push @('')
+Check "K2 Enter keeps the saved URL" ((Get-MonitorUrl -SavedDefault 'https://saved.example.com/a') -eq 'https://saved.example.com/a' -and $script:PromptCount -eq 1)
+
+Push @('Site Portal')
+$m1 = Get-MonitorName -SavedDefault '' -Existing @()
+Check "K3 monitor name prompt returns the cleaned name" ($m1 -eq 'Site Portal' -and $script:PromptCount -eq 1)
+Push @('***', 'HST eChart')
+$m2 = Get-MonitorName -SavedDefault '' -Existing @()
+Check "K3 a name with no letters or digits is refused" ($m2 -eq 'HST eChart')
+Push @('')
+Check "K3 Enter takes the only monitor already installed" ((Get-MonitorName -SavedDefault '' -Existing @([PSCustomObject]@{ Name = 'HST eChart'; Url = 'https://x' })) -eq 'HST eChart')
+
+Push @('')
+Check "K4 Enter keeps the saved content marker" ((Get-ContentMarker -SavedDefault 'Sign In') -eq 'Sign In')
+Push @('-')
+Check "K4 a single dash clears the marker" ((Get-ContentMarker -SavedDefault 'Sign In') -eq '')
+Push @('Welcome back')
+Check "K4 typed text becomes the marker" ((Get-ContentMarker -SavedDefault '') -eq 'Welcome back')
+
+# Two monitors on one server: different folders, tasks, files, and subjects
+$MonitorName = 'HST eChart'; $SiteName = 'CapCity'
+$InstallDir = Join-Path $kRoot (ConvertTo-MonitorSlug $MonitorName); $Url = 'https://a.example.com/one'
+$genA = New-MonitorContent -SiteName 'CapCity' -Mail $mRelay
+$MonitorName = 'Patient Portal'
+$InstallDir = Join-Path $kRoot (ConvertTo-MonitorSlug $MonitorName); $Url = 'https://b.example.com/two'
+$genB = New-MonitorContent -SiteName 'CapCity' -Mail $mRelay
+Check "K5 two monitors bake different names, URLs, folders, and data files" ($genA -match "(?m)^\`$MonitorName\s+=\s+'HST eChart'$" -and $genB -match "(?m)^\`$MonitorName\s+=\s+'Patient Portal'$" -and $genA -match "(?m)^\`$Url\s+=\s+'https://a\.example\.com/one'$" -and $genB -match "(?m)^\`$Url\s+=\s+'https://b\.example\.com/two'$" -and $genA -match "HST-eChart\\heartbeat\.json" -and $genB -match "Patient-Portal\\heartbeat\.json" -and (ParseOk $genA) -and (ParseOk $genB))
+Check "K5 the installer names the folder and the task after the monitor" ($src -match '\$InstallDir = Join-Path \$InstallRoot \(ConvertTo-MonitorSlug \$MonitorName\)' -and $src -match '\$TaskName   = "\$TaskNamePrefix\$MonitorName"' -and $src -match '(?m)^\$TaskNamePrefix\s+=\s+"Curl Monitor - "')
+$labA = Get-AlertLabel -MonitorName 'HST eChart' -SiteName 'CapCity' -HostName 'HOST1'
+$labB = Get-AlertLabel -MonitorName 'Patient Portal' -SiteName 'CapCity' -HostName 'HOST1'
+Check "K5 alert labels tell the two monitors apart on the same server" ($labA -eq 'HST eChart at CapCity (HOST1)' -and $labB -eq 'Patient Portal at CapCity (HOST1)' -and (Get-AlertLabel -MonitorName '' -SiteName 'CapCity' -HostName 'HOST1') -eq 'CapCity (HOST1)')
+
+# Re-running with the same name upgrades in place
+$upgradeDir = Join-Path $kRoot 'HST-eChart'
+New-Item $upgradeDir -ItemType Directory -Force | Out-Null
+Set-Content (Join-Path $upgradeDir 'Watch-CurlMonitor.ps1') -Value '# monitor' -Encoding UTF8
+@{ MonitorName = 'HST eChart'; SiteName = 'CapCity'; Url = 'https://a.example.com/one'; ContentMarker = 'Sign In' } | ConvertTo-Json | Set-Content (Join-Path $upgradeDir 'install-settings.json') -Encoding UTF8
+$installed = @(Get-InstalledMonitor -Root $kRoot)
+Check "K6 installed monitors are listed with their names and URLs" ($installed.Count -eq 1 -and $installed[0].Name -eq 'HST eChart' -and $installed[0].Slug -eq 'HST-eChart' -and $installed[0].Url -eq 'https://a.example.com/one')
+Push @('')
+Check "K6 re-running defaults to that monitor, so the same folder is upgraded" (((ConvertTo-MonitorSlug (Get-MonitorName -SavedDefault 'HST eChart' -Existing $installed)) -eq 'HST-eChart') -and (Test-Path $upgradeDir))
+
+# Migration from the older HST-only layout, against scratch folders and a task that does not exist
+$legacyDir = Join-Path $kRoot 'old-HSTProbe'
+New-Item $legacyDir -ItemType Directory | Out-Null
+@{ SiteName = 'CapCity'; Url = 'https://legacy.example.com/echart'; MailMethod = 'Graph'; GraphClientId = 'cid'; CredentialFor = 'cid' } | ConvertTo-Json | Set-Content (Join-Path $legacyDir 'install-settings.json') -Encoding UTF8
+Set-Content (Join-Path $legacyDir 'Watch-HSTeChartUptime.ps1') -Value '# old monitor' -Encoding UTF8
+Set-Content (Join-Path $legacyDir 'HST-eChart-Latency_202609.csv') -Value 'a,b' -Encoding UTF8
+Set-Content (Join-Path $legacyDir 'HST-eChart-Outages.csv') -Value 'c,d' -Encoding UTF8
+Set-Content (Join-Path $legacyDir 'HST-eChart-Drops.log') -Value '2026-09-15 06:16:14 | SLOW      | x' -Encoding UTF8
+Set-Content (Join-Path $legacyDir 'HST-eChart-Monitor_20260915.log') -Value 'transcript' -Encoding UTF8
+Set-Content (Join-Path $legacyDir 'smtp-credential.bin') -Value 'Y2lwaGVy' -Encoding ASCII
+Set-Content (Join-Path $legacyDir 'daily-summary-sent.txt') -Value '2026-09-15' -Encoding ASCII
+@{ Beat = '2026-09-15T10:00:00.0000000Z'; IsDown = $true; ConsecutiveFailures = 5; Stopped = $false } | ConvertTo-Json | Set-Content (Join-Path $legacyDir 'monitor-heartbeat.json') -Encoding UTF8
+$legacy = Get-LegacyInstall -Dir $legacyDir -TaskName 'No Such Curl Task' -Path '\DIT\'
+Check "K7 the older install is found with its settings and URL" ($legacy -and -not $legacy.HasTask -and $legacy.Url -eq 'https://legacy.example.com/echart' -and $legacy.SiteName -eq 'CapCity')
+Check "K7 no older install means nothing to migrate" ($null -eq (Get-LegacyInstall -Dir (Join-Path $kRoot 'missing') -TaskName 'No Such Curl Task' -Path '\DIT\'))
+$newDir = Join-Path $kRoot 'HST-eChart-migrated'
+New-Item $newDir -ItemType Directory | Out-Null
+$migrated = Invoke-LegacyMigration -Legacy $legacy -Destination $newDir
+$names = @(Get-ChildItem $newDir -File -Force | ForEach-Object { $_.Name } | Sort-Object)
+Check "K8 history moves under the new names and the old folder is gone" ($migrated -and -not (Test-Path $legacyDir) -and (@($names | Where-Object { $_ -notlike 'legacy-*' }) -join ',') -eq 'credential.bin,Drops.log,heartbeat.json,install-settings.json,Latency_202609.csv,Outages.csv,summary-sent.txt,Transcript_20260915.log')
+Check "K8 carried settings prefill the new prompts" ((Get-Content (Join-Path $newDir 'install-settings.json') -Raw | ConvertFrom-Json).Url -eq 'https://legacy.example.com/echart')
+$hbM = Get-Content (Join-Path $newDir 'heartbeat.json') -Raw | ConvertFrom-Json
+Check "K8 the carried heartbeat is marked stopped, so the new monitor sends no restart notice and still carries the outage" ($hbM.Stopped -eq $true -and $hbM.IsDown -eq $true -and [int]$hbM.ConsecutiveFailures -eq 5)
+Check "K8 the drops log records the move" ((Get-Content (Join-Path $newDir 'Drops.log') -Raw) -match '\| STOP      \| Monitor stopped by the installer on .+ and moved to ')
+
+# A file that cannot be copied leaves the old folder in place
+$legacyDir2 = Join-Path $kRoot 'old-HSTProbe2'
+New-Item $legacyDir2 -ItemType Directory | Out-Null
+@{ SiteName = 'CapCity'; Url = 'https://legacy2.example.com/x' } | ConvertTo-Json | Set-Content (Join-Path $legacyDir2 'install-settings.json') -Encoding UTF8
+Set-Content (Join-Path $legacyDir2 'HST-eChart-Outages.csv') -Value 'e,f' -Encoding UTF8
+Set-Content (Join-Path $legacyDir2 'HST-eChart-Drops.log') -Value 'x' -Encoding UTF8
+$newDir2 = Join-Path $kRoot 'HST-eChart-blocked'
+New-Item $newDir2 -ItemType Directory | Out-Null
+$blocker = [System.IO.File]::Open((Join-Path $legacyDir2 'HST-eChart-Outages.csv'), [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
+$legacy2 = Get-LegacyInstall -Dir $legacyDir2 -TaskName 'No Such Curl Task' -Path '\DIT\'
+$migrated2 = Invoke-LegacyMigration -Legacy $legacy2 -Destination $newDir2
+$blocker.Close()
+Check "K9 a file that will not copy keeps the old folder and says so" (-not $migrated2 -and (Test-Path $legacyDir2) -and (($script:Logs -join "`n") -match "did not copy, so '.*old-HSTProbe2' is left in place"))
+# A destination file that is locked or already newer is never overwritten: the legacy copy lands beside it
+$legacyDir3 = Join-Path $kRoot 'old-HSTProbe3'
+New-Item $legacyDir3 -ItemType Directory | Out-Null
+@{ SiteName = 'CapCity'; Url = 'https://legacy3.example.com/x' } | ConvertTo-Json | Set-Content (Join-Path $legacyDir3 'install-settings.json') -Encoding UTF8
+Set-Content (Join-Path $legacyDir3 'HST-eChart-Outages.csv') -Value 'old,short' -Encoding UTF8
+$newDir3 = Join-Path $kRoot 'HST-eChart-kept'
+New-Item $newDir3 -ItemType Directory | Out-Null
+Set-Content (Join-Path $newDir3 'Outages.csv') -Value 'newer history that must survive' -Encoding UTF8
+$legacy3 = Get-LegacyInstall -Dir $legacyDir3 -TaskName 'No Such Curl Task' -Path '\DIT\'
+$migrated3 = Invoke-LegacyMigration -Legacy $legacy3 -Destination $newDir3
+Check "K9 history already in the new folder survives and the legacy copy lands beside it" ($migrated3 -and (Get-Content (Join-Path $newDir3 'Outages.csv')) -eq 'newer history that must survive' -and @(Get-ChildItem $newDir3 -Filter 'legacy-*Outages.csv').Count -eq 1)
+Remove-Item $kRoot -Recurse -Force -ErrorAction SilentlyContinue
+$InstallRoot = 'C:\ProgramData\DIT\CurlMonitor'
+
+
+Section "L. Fixes from the stress campaign"
+$TaskNamePrefix = 'Curl Monitor - '; $MaxTaskNameLength = 238
+$lExisting = @([PSCustomObject]@{ Name = 'HST eChart'; Slug = 'HST-eChart'; Path = 'C:\x\HST-eChart'; Url = 'u' }, [PSCustomObject]@{ Name = 'Portal'; Slug = 'Portal'; Path = 'C:\x\Portal'; Url = 'v' })
+Check "L1 a name that cleans to another monitor's folder is reported, whatever the punctuation or case" ((Get-SlugClash -Name 'HST_eChart' -Existing $lExisting).Name -eq 'HST eChart' -and (Get-SlugClash -Name 'hst echart' -Existing $lExisting).Name -eq 'HST eChart' -and (Get-SlugClash -Name 'HST.eChart' -Existing $lExisting).Name -eq 'HST eChart')
+Check "L1 the same name and an unrelated name are not clashes" ($null -eq (Get-SlugClash -Name 'HST eChart' -Existing $lExisting) -and $null -eq (Get-SlugClash -Name 'Billing Portal' -Existing $lExisting))
+Check "L1 wizard offers to upgrade the clashing monitor and returns its installed name" ($src -match "U = upgrade '\`$\(\`$clash\.Name\)' in place, N = type another name")
+Push @('HST_eChart', 'U')
+$lName = Get-MonitorName -SavedDefault '' -Existing $lExisting
+Check "L1 answering U adopts the installed name instead of overwriting its folder" ($lName -eq 'HST eChart' -and $script:PromptCount -eq 2 -and (($script:Logs -join "`n") -match "uses the same folder as the installed monitor 'HST eChart'"))
+Push @('HST_eChart', 'N', 'Billing Portal')
+$lName = Get-MonitorName -SavedDefault '' -Existing $lExisting
+Check "L1 answering N asks again and takes a name with its own folder" ($lName -eq 'Billing Portal' -and $script:PromptCount -eq 3)
+
+Check "L2 a monitor name too long for a task name is refused before anything is written" ((Test-MonitorNameLength 'HST eChart') -and -not (Test-MonitorNameLength ('x' * 230)) -and (($script:Logs -join "`n") -match 'Monitor name is too long'))
+Push @(('y' * 240), 'Short Name')
+$lName = Get-MonitorName -SavedDefault '' -Existing @()
+Check "L2 the wizard keeps asking until the name fits the task name limit" ($lName -eq 'Short Name' -and $script:PromptCount -eq 2)
+
+$NonInteractive = $true; $MonitorNameOverride = ''; $MonitorName = 'RMM Named'
+$lName = Get-MonitorName -SavedDefault '' -Existing @()
+Check "L3 a silent install falls back to the config block monitor name" ($lName -eq 'RMM Named')
+$MonitorName = 'HST_eChart'
+$lName = Get-MonitorName -SavedDefault '' -Existing $lExisting
+Check "L3 a silent install upgrades the clashing monitor rather than overwriting it" ($lName -eq 'HST eChart' -and (($script:Logs -join "`n") -match 'Upgrading that monitor instead of overwriting it'))
+$MonitorName = ('z' * 240)
+Check "L3 a silent install refuses a name too long for a task name" ((Get-MonitorName -SavedDefault '' -Existing @()) -eq '')
+$MonitorName = ''
+
+$Url = 'https://config-block.example/health'
+Check "L4 a silent re-deploy repoints the monitor from the config block" ((Get-MonitorUrl -SavedDefault 'https://old.example/health') -eq 'https://config-block.example/health')
+$ExpectedContentMarker = 'From config'
+Check "L4 a silent re-deploy takes the marker from the config block too" ((Get-ContentMarker -SavedDefault 'Saved text') -eq 'From config')
+$ExpectedContentMarker = ''
+Check "L4 a silent re-deploy with no config marker keeps the saved one" ((Get-ContentMarker -SavedDefault 'Saved text') -eq 'Saved text')
+$NonInteractive = $false; $Url = ''
+
+Push @('')
+$m1 = Get-ContentMarker -SavedDefault 'Sign in'
+Check "L5 Enter keeps the saved text and the prompt says so" ($m1 -eq 'Sign in' -and $script:PromptLog[0] -eq "Required text (Enter = keep 'Sign in', - = no text check)")
+Push @('-')
+$m2 = Get-ContentMarker -SavedDefault 'Sign in'
+Check "L5 a dash drops the text check on a re-run" ($m2 -eq '' -and (($script:Logs -join "`n") -match 'No text check'))
+Push @('')
+$m3 = Get-ContentMarker -SavedDefault ''
+Check "L5 with nothing saved the prompt still offers blank for none" ($m3 -eq '' -and $script:PromptLog[0] -eq 'Required text (blank for none)')
+
+$lMig = Join-Path $kRoot 'mig'
+$lLegacy = Join-Path $lMig 'legacy'; $lDest = Join-Path $lMig 'dest'
+New-Item (Join-Path $lLegacy 'Archive') -ItemType Directory -Force | Out-Null
+New-Item $lDest -ItemType Directory -Force | Out-Null
+Set-Content (Join-Path $lLegacy 'HST-eChart-Outages.csv') -Value 'old'
+Set-Content (Join-Path $lLegacy 'Archive/HST-eChart-Latency_202501.csv') -Value 'archived rows'
+Set-Content (Join-Path $lLegacy 'notes-from-the-admin.txt') -Value 'keep me'
+Set-Content (Join-Path $lDest 'Outages.csv') -Value 'newer history that must survive'
+$lLegacyObj = [PSCustomObject]@{ Dir = $lLegacy; TaskName = 'x'; TaskPath = '\None\'; HasTask = $false; Settings = $null; Url = ''; SiteName = '' }
+$lOk = Invoke-LegacyMigration -Legacy $lLegacyObj -Destination $lDest
+Check "L6 migration reports success and removes the old folder" ($lOk -and -not (Test-Path $lLegacy))
+Check "L6 history the new monitor already wrote is never overwritten" ((Get-Content (Join-Path $lDest 'Outages.csv')) -eq 'newer history that must survive' -and @(Get-ChildItem $lDest -Filter 'legacy-*Outages.csv').Count -eq 1)
+Check "L6 files in subfolders and unrecognised files are carried, not deleted" (@(Get-ChildItem $lDest -Filter '*Latency_202501.csv').Count -eq 1 -and @(Get-ChildItem $lDest -Filter 'legacy-*notes-from-the-admin.txt').Count -eq 1)
+Check "L6 the migrated credential is locked to SYSTEM and Administrators as it lands" ($src -match '(?s)Split-Path \$targetPath -Leaf\) -eq \$CredentialFileName.*?icacls\.exe .\$targetPath. /inheritance:r /grant:r')
+Check "L6 a copy that fails keeps the old folder and says so" ($src -match 'file\(s\) did not copy, so .* is left in place')
+Check "L7 migration runs after the monitor is written, just before the task is registered" ($src -match "(?s)Wrote and verified monitor script.*?if \(\`$migrate\) \{\s+if \(Invoke-LegacyMigration -Legacy \`$legacy -Destination \`$InstallDir\)" -and $src -match 'An abort before this point')
+Check "L7 the installer acts on the migration result rather than ignoring it" ($src -match 'Migration did not finish' -and -not ($src -match '\$null = Invoke-LegacyMigration'))
+
+Check "L8 folder hardening leaves stored secrets and other monitors' folders alone" ($src -match '(?m)^\s+if \(\$item\.PSIsContainer\) \{ continue \}' -and $src -match '(?m)^\s+if \(\$item\.Name -eq \$CredentialFileName\) \{ continue \}' -and -not ($src -match '/reset /T /C'))
+Check "L8 every stored secret is re-locked after hardening, on both the normal and the migration path" ($src -match 'function Protect-StoredSecret' -and ([regex]::Matches($src, 'Protect-StoredSecret -Root \$InstallRoot')).Count -eq 2)
+
+$lGen = New-MonitorContent -SiteName 'S' -Mail $mRelay
+Check "L9 the probe caps what it downloads and the reason table names the cap" ($lGen -match '--max-filesize \$MaxBodyBytes' -and $lGen -match '(?m)^\$MaxBodyBytes\s+=\s+\d+$' -and $lGen -match "63 \{ return 'Response larger than the size limit' \}")
+Check "L9 an oversized body is never scanned for the marker" ($lGen -match '\$bodyBytes -gt \$MaxBodyBytes' -and $lGen -match '\$bodyBytes = \(Get-Item \$tempBody\)\.Length')
+Check "L10 transcripts are pruned at startup, not only on a day rollover" ($lGen -match '\$startupCutoff = \(Get-Date\)\.AddDays\(-\$LogRetentionDays\)' -and $lGen -match "(?s)Start-Transcript -Path \`$transcriptPath -Append.*?Transcript_\*\.log' -ErrorAction SilentlyContinue \| Where-Object \{ \`$_\.LastWriteTime -lt \`$startupCutoff \}")
+Check "L10 the daily summary reads rotated drops logs inside the window" ($lGen -match "Get-ChildItem -Path \`$InstallDir -Filter 'Drops_\*\.log'" -and $lGen -match '\$_\.LastWriteTime -ge \$cutoff')
+
+$lSeq = @(Rep (Pl 300) 20) + @(Rep (Pl 4500) 20) + @(Rep (Pl 300) 25)
+$lRun = RunSlow -State (NewSlow) -Polls $lSeq -Start $T0
+$lSlow = @($lRun.Emails | Where-Object { $_.D.EmailKind -eq 'Slow' })[0].D
+Check "L11 a slow period counts only the polls from its first bad one" ($lSlow.State.Polls -eq 10 -and $lSlow.State.SlowPolls -eq 10 -and $lSlow.State.FailedPolls -eq 0)
+$lResolved = @($lRun.Emails | Where-Object { $_.D.EmailKind -eq 'SlowResolved' })[0].D
+Check "L11 SLOW RESOLVED reports the period's own polls, not the healthy ones before it" ($lResolved.EmailBody -match '<td[^>]*>Polls while slow</td><td[^>]*>20: 20 slower than 3000 ms, 0 failed</td>')
+
+$lBack = NewSlow
+$lBack.IsSlow = $true; $lBack.StartUtc = $T0.AddMinutes(30); $lBack.StartLocalStr = 'L'; $lBack.LastAlertUtc = $T0.AddMinutes(30); $lBack.Polls = 12; $lBack.SlowPolls = 12
+$lBack.Samples = @(0..9 | ForEach-Object { [PSCustomObject]@{ Utc = $T0.AddMinutes(29).AddSeconds($_ * 15); LocalStr = 'F'; Slow = $true; Failed = $false; Ms = 5000 } })
+$lStep = Update-SlowState -State $lBack -Result (SlowRes 250) -Failed $false -IsDown $false -NowUtc $T0 -SlowThresholdMs 3000 -WindowMinutes 5 -AlertPercent 50 -ClearPercent 10 -ReAlertMinutes 30 -AlertOnRecovery $true -SiteName 'CapCity' -Url 'http://x' -HostName 'HOST1' -MonitorName 'Demo'
+Check "L12 a clock that steps back drops future samples and pulls the period to now" (@($lStep.State.Samples | Where-Object { $_.Utc -gt $T0 }).Count -eq 0 -and $lStep.State.Samples.Count -eq 1 -and ($null -eq $lStep.State.StartUtc -or $lStep.State.StartUtc -le $T0))
+$lBack2 = NewSlow
+$lBack2.IsSlow = $true; $lBack2.StartUtc = $T0.AddMinutes(-20); $lBack2.StartLocalStr = 'L'; $lBack2.LastAlertUtc = $T0.AddMinutes(40); $lBack2.Polls = 40; $lBack2.SlowPolls = 40
+$lBack2.Samples = @(0..19 | ForEach-Object { [PSCustomObject]@{ Utc = $T0.AddMinutes(-4).AddSeconds($_ * 12); LocalStr = 'F'; Slow = $false; Failed = $false; Ms = 200 } })
+$lStep2 = Update-SlowState -State $lBack2 -Result (SlowRes 200) -Failed $false -IsDown $false -NowUtc $T0 -SlowThresholdMs 3000 -WindowMinutes 5 -AlertPercent 50 -ClearPercent 10 -ReAlertMinutes 30 -AlertOnRecovery $true -SiteName 'CapCity' -Url 'http://x' -HostName 'HOST1' -MonitorName 'Demo'
+Check "L12 a period whose last alert is in the future can still clear after the step back" ($lStep2.EmailKind -eq 'SlowResolved' -and -not $lStep2.State.IsSlow)
 
 Write-Host ""
 Write-Host "TOTAL: $script:pass passed, $script:fail failed"

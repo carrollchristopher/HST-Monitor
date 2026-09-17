@@ -38,9 +38,9 @@ $ClientSecret   = ""                       # Plaintext secret for ad hoc use. Le
 $MailFrom       = ""
 $MailTo         = ""
 
-$InstallDir          = "C:\ProgramData\DIT\HSTProbe"
+$InstallDir          = "C:\ProgramData\DIT\CurlMonitor"
 $SettingsFileName    = "install-settings.json"
-$CredentialFileName  = "smtp-credential.bin"
+$CredentialFileName  = "credential.bin"
 
 $HashTable_PowerShellTranscriptLogsbyKeyword = [Ordered]@{
     ADDED          = "ADDED |"
@@ -153,7 +153,7 @@ Write-Host "  2. Exchange:     Get-ServicePrincipal | fl DisplayName,AppId,Objec
 Write-Host ""
 
 # Step 2: one send
-$body = @{ message = @{ subject = "[HST MONITOR TEST] diagnostic $(Get-Date -Format 'HH:mm:ss')"; body = @{ contentType = 'Text'; content = "Diagnostic send from Test-HSTMailSend.ps1 at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')." }; toRecipients = @(@{ emailAddress = @{ address = $MailTo } }) }; saveToSentItems = $false } | ConvertTo-Json -Depth 6
+$body = @{ message = @{ subject = "[MONITOR TEST] diagnostic $(Get-Date -Format 'HH:mm:ss')"; body = @{ contentType = 'Text'; content = "Diagnostic send from Test-CurlMonitorMailSend.ps1 at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')." }; toRecipients = @(@{ emailAddress = @{ address = $MailTo } }) }; saveToSentItems = $false } | ConvertTo-Json -Depth 6
 try {
     Invoke-RestMethod -Method Post -Uri "https://graph.microsoft.com/v1.0/users/$MailFrom/sendMail" -Headers @{ Authorization = "Bearer $($tok.access_token)" } -Body $body -ContentType 'application/json' -ErrorAction Stop | Out-Null
     Write-Log -Level SUCCESS -Message "Send accepted. Check $MailTo. The mail path works; nothing is broken."

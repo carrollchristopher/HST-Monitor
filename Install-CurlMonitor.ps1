@@ -1,13 +1,16 @@
 <#
 .SYNOPSIS
-    Self-contained installer that deploys and starts the always-on HST eChart monitor on a site server.
+    Self-contained installer that deploys and starts an always-on curl monitor for any URL on a site server.
 
 .DESCRIPTION
     Run this one script as administrator on a site server. It does everything with no second file to manage.
     1. Confirms it is running elevated, relaunching as administrator if not, and checks curl.exe and the
        ScheduledTasks module are present.
-    2. Loads any settings saved by a previous run so re-runs prefill every prompt.
-    3. Prompts for the site name so alert subjects and logs identify the site cleanly.
+    2. Asks what to call this monitor, for example "HST eChart", which names its folder, its scheduled task, and
+       its alerts. One server can run several monitors, one per URL, side by side. Re-running with the same name
+       upgrades that monitor in place and leaves the others alone.
+    3. Asks for the URL to watch, the site name, and optional text that must appear on the page, all prefilled
+       from the last run. Poll interval, timeouts, and alert thresholds live in the config block below.
     4. Walks through a mail setup wizard. Microsoft Graph is recommended (HTTPS only). On the first site the
        wizard creates the tenant side itself: signs you in, creates the app registration, creates the shared
        sender mailbox (no license), limits the app to sending only as that mailbox (Exchange RBAC for
@@ -20,6 +23,8 @@
     7. Stops any running copy, writes the monitor, registers a Scheduled Task (SYSTEM, at startup, highest
        privileges, no time limit, single instance, restart on failure), starts it, and verifies it is running.
     8. Runs a preflight probe and sends an install confirmation email.
+    An older HST-only install (C:\ProgramData\DIT\HSTProbe with its own task) is migrated on first run: its
+    settings and history move into the new layout and the old task and folder are removed.
     Set $NonInteractive to $true and fill in the config block to deploy silently through an RMM.
 
 .REQUIREMENTS
@@ -35,40 +40,53 @@
     Author:      Christopher Carroll
     Created:     09/04/2026
     Idempotency: Safe to re-run. Existing task, monitor, settings, and credential file are replaced cleanly.
-    Context:     Compass HST slowness investigation across the 5 noisiest of 14 shared-resource sites. Scheduled
-                 Task chosen over a service wrapper to avoid a third-party binary at a healthcare client.
+    Context:     Written for an HST eChart slowness investigation across shared-resource clinic sites, then
+                 generalised: one installer, any URL, one folder and task per monitor. Scheduled Task chosen
+                 over a service wrapper to avoid a third-party binary at a healthcare client.
                  Direct Send is recommended because Microsoft disables Basic auth SMTP AUTH by default at the end
                  of December 2026; Direct Send and IP-based relay are not affected.
 
 .LINK
-    https://prodasp09.hstpathways.com/p95_CSP/HSTeChart
+    https://curl.se/docs/manpage.html
 #>
 
 Remove-Variable * -ErrorAction SilentlyContinue
 
-# Deployment locations
-$InstallDir            = "C:\ProgramData\DIT\HSTProbe"
-$MonitorFileName       = "Watch-HSTeChartUptime.ps1"
+# Deployment locations. Each monitor gets its own folder under the root and its own scheduled task.
+$InstallRoot           = "C:\ProgramData\DIT\CurlMonitor"
+$InstallDir            = $InstallRoot                  # Replaced with the monitor's own folder once its name is known
+$MonitorFileName       = "Watch-CurlMonitor.ps1"
 $SettingsFileName      = "install-settings.json"
-$CredentialFileName    = "smtp-credential.bin"
-$TaskName              = "HST eChart Monitor"
+$CredentialFileName    = "credential.bin"
+$TaskNamePrefix        = "Curl Monitor - "
+$MaxTaskNameLength     = 238                           # Task Scheduler limit, checked before anything is written
+$TaskName              = $TaskNamePrefix               # Completed with the monitor name once it is known
 $TaskPath              = "\DIT\"
 $RunAsUser             = "SYSTEM"
 $RestartCount          = 3
 $RestartMinutes        = 1
 
-# Monitor settings baked into the deployed script
-$Url                   = "https://prodasp09.hstpathways.com/p95_CSP/HSTeChart"
+# An older HST-only install is migrated into the layout above and then removed
+$LegacyInstallDir      = "C:\ProgramData\DIT\HSTProbe"
+$LegacyTaskName        = "HST eChart Monitor"
+$LegacyMonitorName     = "HST eChart"
+
+# Prompted every run, prefilled from the last one. In non-interactive mode these are used as-is.
+$MonitorName           = ""                            # For example "HST eChart". Names the folder, the task, and the alerts.
+$Url                   = ""                            # The URL to watch, http:// or https://
+$ExpectedContentMarker = ""                            # Text that must appear on the page. Blank checks only the status and the size.
+
+# Monitor settings baked into the deployed script. Not prompted: edit here before deploying.
 $IntervalSeconds       = 10
 $TimeoutSeconds        = 15
-$MaxRedirects          = 5                             # The endpoint redirects to its sign-in page. The probe follows up to this many hops.
-$ExpectedContentMarker = "HST Federation Provider"     # Title of the sign-in page. Populated means marker present and body at least MinPopulatedBytes.
-$MinPopulatedBytes     = 1000
+$MaxRedirects          = 5                             # Redirects the probe follows before giving up
+$MinPopulatedBytes     = 1000                          # A 200 with a smaller body counts as a failed poll
+$MaxBodyBytes          = 8MB                           # curl stops downloading past this, so one huge reply cannot fill memory
 $SlowThresholdMs       = 3000
 $DownThreshold         = 3
 $ReAlertMinutes        = 30
 $AlertOnRecovery       = $true
-$AlertOnSlow           = $true                         # Email when HST eChart stays slow or keeps failing without a full outage
+$AlertOnSlow           = $true                         # Email when the URL stays slow or keeps failing without a full outage
 $SlowWindowMinutes     = 5                             # Rolling window the slow alert looks at
 $SlowAlertPercent      = 50                            # Share of polls in the window, slower than SlowThresholdMs or failed, that declares SLOW
 $SlowClearPercent      = 10                            # Share at or below which the slow period is over
@@ -80,8 +98,8 @@ $MailMethod            = "Graph"                       # Graph, DirectSend, Rela
 $GraphTenantId         = ""                            # Printed by the tenant setup step on the first site
 $GraphClientId         = ""                            # Printed by the tenant setup step on the first site
 $GraphSecretExpires    = ""                            # yyyy-MM-dd. Monitor warns 30 days before.
-$GraphAppDisplayName   = "HST Monitor"             # Tenant setup step: app registration name
-$GraphPolicyGroupAlias = "hst-monitor-senders"        # Tenant setup step: mail-enabled security group alias, created in the sender's domain
+$GraphAppDisplayName   = "Curl Monitor"                # Tenant setup step: app registration name
+$GraphPolicyGroupAlias = "curl-monitor-senders"        # Tenant setup step: mail-enabled security group alias, created in the sender's domain
 $GraphSecretMonths     = 24                            # Tenant setup step: secret lifetime, Entra maximum is 24
 $SmtpServer            = ""                            # Leave blank for DirectSend to auto-discover from the sender domain MX
 $SmtpPort              = 25
@@ -93,6 +111,7 @@ $SmtpAuthUser          = ""                            # Authenticated only. Pas
 # Installer behavior
 $NonInteractive        = $false                        # $true = no prompts, use the config block, for RMM deployment
 $SiteNameOverride      = ""                            # Used when non-interactive, otherwise prompted
+$MonitorNameOverride   = ""                            # Used when non-interactive, otherwise prompted
 $SendInstallTestEmail  = $true
 
 # Internal state for the installer's own Graph calls, not settings
@@ -364,9 +383,23 @@ function Protect-InstallFolder {
     & icacls.exe "$Path" /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)(F)" "*S-1-5-32-544:(OI)(CI)(F)" "*S-1-5-32-545:(OI)(CI)(RX)" | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "icacls could not set permissions on '$Path' (exit $LASTEXITCODE)." }
     # Files already inside may carry explicit grants from whoever created them. Make them inherit from the folder.
+    # Credential files and other monitors' folders are left alone: resetting into them would drop the
+    # SYSTEM and Administrators only lock that Save-SmtpCredential puts on every stored secret.
     foreach ($item in (Get-ChildItem -Path $Path -Force -ErrorAction SilentlyContinue)) {
-        & icacls.exe "$($item.FullName)" /reset /T /C | Out-Null
+        if ($item.PSIsContainer) { continue }
+        if ($item.Name -eq $CredentialFileName) { continue }
+        & icacls.exe "$($item.FullName)" /reset /C | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "icacls could not reset permissions on '$($item.FullName)' (exit $LASTEXITCODE)." }
+    }
+}
+
+function Protect-StoredSecret {
+    # Re-applies the SYSTEM and Administrators only lock to every stored secret under the root. Folder hardening
+    # runs on every install, so without this a second monitor would leave the first one's secret readable by Users.
+    param([Parameter(Mandatory)][string]$Root)
+    foreach ($file in @(Get-ChildItem -Path $Root -Filter $CredentialFileName -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+        & icacls.exe "$($file.FullName)" /inheritance:r /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)" | Out-Null
+        if ($LASTEXITCODE -ne 0) { Write-Log -Level WARNING -Message "Could not re-lock '$($file.FullName)' (icacls exit $LASTEXITCODE). Check its permissions by hand." }
     }
 }
 
@@ -408,10 +441,18 @@ function ConvertTo-GraphMailBody {
 
 function New-AlertBody {
     # Builds a compact HTML body: a heading, a two-column table of details, and a footer naming the sending server
-    param([Parameter(Mandatory)][string]$Heading, [Parameter(Mandatory)][System.Collections.IDictionary]$Details, [string]$Footer = "Sent by the HST eChart monitor on $env:COMPUTERNAME.")
+    param([Parameter(Mandatory)][string]$Heading, [Parameter(Mandatory)][System.Collections.IDictionary]$Details, [string]$Footer = "Sent by the curl monitor on $env:COMPUTERNAME.")
     $enc = { param($s) [System.Net.WebUtility]::HtmlEncode([string]$s) }
     $rows = foreach ($k in $Details.Keys) { "<tr><td style='padding:3px 16px 3px 0;color:#555;white-space:nowrap;vertical-align:top'>$(& $enc $k)</td><td style='padding:3px 0'>$(& $enc $Details[$k])</td></tr>" }
     return "<html><body style='font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#222'><p style='font-size:16px;font-weight:600;margin:0 0 10px'>$(& $enc $Heading)</p><table style='border-collapse:collapse'>$($rows -join '')</table><p style='margin:14px 0 0;color:#777;font-size:12px'>$(& $enc $Footer)</p></body></html>"
+}
+
+function Get-AlertLabel {
+    # "{Monitor} at {Site} ({HOST})" for subjects, dropping any part that is not set
+    param([string]$MonitorName, [string]$SiteName, [string]$HostName)
+    $label = if ($MonitorName -and $SiteName) { "$MonitorName at $SiteName" } elseif ($MonitorName) { $MonitorName } else { $SiteName }
+    if ($HostName) { return "$label ($HostName)" }
+    return $label
 }
 
 function Get-RestErrorDetail {
@@ -678,7 +719,7 @@ function Invoke-ExoCommand {
     # Runs one Exchange Online cmdlet through the Exchange admin REST endpoint (what the EXO module uses internally). Returns the value array.
     # Throttling and server errors are retried a few times so a blip never changes which setup path runs.
     param([Parameter(Mandatory)][string]$Token, [Parameter(Mandatory)][string]$TenantId, [Parameter(Mandatory)][string]$Upn, [Parameter(Mandatory)][string]$Cmdlet, [hashtable]$Parameters = @{})
-    $headers = @{ Authorization = "Bearer $Token"; 'X-AnchorMailbox' = "UPN:$Upn"; 'X-ResponseFormat' = 'json'; 'Prefer' = 'odata.maxpagesize=1000'; 'X-ClientApplication' = 'HSTMonitorInstaller' }
+    $headers = @{ Authorization = "Bearer $Token"; 'X-AnchorMailbox' = "UPN:$Upn"; 'X-ResponseFormat' = 'json'; 'Prefer' = 'odata.maxpagesize=1000'; 'X-ClientApplication' = 'CurlMonitorInstaller' }
     $body = @{ CmdletInput = @{ CmdletName = $Cmdlet; Parameters = $Parameters } } | ConvertTo-Json -Depth 6 -Compress
     $r = $null
     for ($attempt = 1; $attempt -le 4; $attempt++) {
@@ -752,7 +793,7 @@ function New-TenantMailApp {
         $app = (Invoke-GraphRequest -Token $t -Method GET -Path "applications?`$filter=displayName eq '$nameLiteral'").value | Select-Object -First 1
         if ($app) { Write-Log -Level FOUND -Message "App registration '$GraphAppDisplayName' exists (AppId $($app.appId)). Reusing it." }
         else {
-            $body = @{ displayName = $GraphAppDisplayName; signInAudience = 'AzureADMyOrg'; notes = "HST eChart monitor alert sender. Restricted to sending only as $SenderAddress in Exchange Online."; requiredResourceAccess = @(@{ resourceAppId = $graphSp.appId; resourceAccess = @(@{ id = $mailSendRole.id; type = 'Role' }) }) }
+            $body = @{ displayName = $GraphAppDisplayName; signInAudience = 'AzureADMyOrg'; notes = "Curl monitor alert sender. Restricted to sending only as $SenderAddress in Exchange Online."; requiredResourceAccess = @(@{ resourceAppId = $graphSp.appId; resourceAccess = @(@{ id = $mailSendRole.id; type = 'Role' }) }) }
             $app = Invoke-GraphRequest -Token $t -Method POST -Path 'applications' -Body $body
             Write-Log -Level CREATED -Message "Created app registration '$GraphAppDisplayName' (AppId $($app.appId))."
         }
@@ -796,7 +837,7 @@ function New-TenantMailApp {
         if (Invoke-ExoCmdlet -Name 'Get-Mailbox' -Parameters @{ Identity = $SenderAddress } -NullOnNotFound) { Write-Log -Level FOUND -Message "Sender mailbox $SenderAddress exists." }
         else {
             $alias = ($SenderAddress -split '@')[0]
-            Invoke-ExoCmdlet -Name 'New-Mailbox' -Parameters @{ Shared = $true; Name = $alias; DisplayName = 'HST Monitor'; PrimarySmtpAddress = $SenderAddress } | Out-Null
+            Invoke-ExoCmdlet -Name 'New-Mailbox' -Parameters @{ Shared = $true; Name = $alias; DisplayName = $GraphAppDisplayName; PrimarySmtpAddress = $SenderAddress } | Out-Null
             Write-Log -Level CREATED -Message "Created shared mailbox $SenderAddress (no license required)."
         }
         # Fresh tenants start dehydrated and reject organization-level writes until customization is enabled
@@ -814,7 +855,7 @@ function New-TenantMailApp {
                 Invoke-ExoCmdlet -Name 'New-ServicePrincipal' -Parameters @{ AppId = $app.appId; ObjectId = $sp.id; DisplayName = $GraphAppDisplayName } | Out-Null
                 Write-Log -Level CREATED -Message "Registered the app's service principal in Exchange Online."
             }
-            $scopeName = 'HST Monitor Send Scope'
+            $scopeName = "$GraphAppDisplayName Send Scope"
             $senderLiteral = $SenderAddress.Replace("'", "''")
             $scope = @(Invoke-ExoCmdlet -Name 'Get-ManagementScope' -Parameters @{ Identity = $scopeName } -NullOnNotFound) | Select-Object -First 1
             if (-not $scope) {
@@ -825,7 +866,7 @@ function New-TenantMailApp {
                 Invoke-ExoCmdlet -Name 'Set-ManagementScope' -Parameters @{ Identity = $scopeName; RecipientRestrictionFilter = "PrimarySmtpAddress -eq '$senderLiteral'" } | Out-Null
                 Write-Log -Level ADDED -Message "Updated management scope '$scopeName' to target $SenderAddress."
             }
-            $assignmentName = 'HST Monitor Mail Send'
+            $assignmentName = "$GraphAppDisplayName Mail Send"
             $assignmentExisted = [bool](Invoke-ExoCmdlet -Name 'Get-ManagementRoleAssignment' -Parameters @{ Identity = $assignmentName } -NullOnNotFound)
             if ($assignmentExisted) { Write-Log -Level FOUND -Message "Role assignment '$assignmentName' exists." }
             else {
@@ -875,7 +916,7 @@ function New-TenantMailApp {
             $policyGroup = "$GraphPolicyGroupAlias@" + (($SenderAddress -split '@')[-1])
             $grp = @(Invoke-ExoCmdlet -Name 'Get-DistributionGroup' -Parameters @{ Identity = $policyGroup } -NullOnNotFound) | Select-Object -First 1
             if (-not $grp) {
-                Invoke-ExoCmdlet -Name 'New-DistributionGroup' -Parameters @{ Type = 'Security'; Name = $GraphPolicyGroupAlias; DisplayName = 'HST Monitor Senders'; PrimarySmtpAddress = $policyGroup } | Out-Null
+                Invoke-ExoCmdlet -Name 'New-DistributionGroup' -Parameters @{ Type = 'Security'; Name = $GraphPolicyGroupAlias; DisplayName = "$GraphAppDisplayName Senders"; PrimarySmtpAddress = $policyGroup } | Out-Null
                 Write-Log -Level CREATED -Message "Created mail-enabled security group $policyGroup."
                 $grp = @(Invoke-ExoCmdlet -Name 'Get-DistributionGroup' -Parameters @{ Identity = $policyGroup } -NullOnNotFound) | Select-Object -First 1
             }
@@ -893,7 +934,7 @@ function New-TenantMailApp {
                     $scopeId = $policyGroup
                     if ($i -ge 5 -and $grp -and $grp.ExternalDirectoryObjectId) { $scopeId = "$($grp.ExternalDirectoryObjectId)" }
                     try {
-                        Invoke-ExoCmdlet -Name 'New-ApplicationAccessPolicy' -Parameters @{ AppId = [string[]]@($app.appId); PolicyScopeGroupId = $scopeId; AccessRight = 'RestrictAccess'; Description = "HST monitor may send only as $SenderAddress" } | Out-Null
+                        Invoke-ExoCmdlet -Name 'New-ApplicationAccessPolicy' -Parameters @{ AppId = [string[]]@($app.appId); PolicyScopeGroupId = $scopeId; AccessRight = 'RestrictAccess'; Description = "$GraphAppDisplayName may send only as $SenderAddress" } | Out-Null
                         $policyDone = $true
                         Write-Log -Level CREATED -Message "Applied application access policy: app restricted to $SenderAddress."
                     }
@@ -915,7 +956,7 @@ function New-TenantMailApp {
     # Mint the secret only now, so failed runs never leave orphan secrets on the app
     $end = (Get-Date).AddMonths([math]::Min(24, [math]::Max(1, [int]$GraphSecretMonths)))
     try {
-        $pw = Invoke-GraphRequest -Token $t -Method POST -Path "applications/$($app.id)/addPassword" -Body @{ passwordCredential = @{ displayName = "HST monitor $(Get-Date -Format 'yyyy-MM-dd') from $SiteName"; endDateTime = $end.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } }
+        $pw = Invoke-GraphRequest -Token $t -Method POST -Path "applications/$($app.id)/addPassword" -Body @{ passwordCredential = @{ displayName = "$GraphAppDisplayName $(Get-Date -Format 'yyyy-MM-dd') from $SiteName"; endDateTime = $end.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } }
         $secret = $pw.secretText
         $script:FreshSecretClientId = $app.appId
         $script:FreshSecretCreatedUtc = (Get-Date).ToUniversalTime()
@@ -925,8 +966,8 @@ function New-TenantMailApp {
     }
     catch { Write-Log -Level FAILED -Message "Could not create the client secret. $($_.Exception.Message) $(Get-RestErrorDetail $_)"; return $null }
 
-    $summary = "HST Monitor app registration`nCreated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') on $SiteName`nTenant ID: $tenantId`nClient ID: $($app.appId)`nSender mailbox: $SenderAddress`nSecret expires: $($end.ToString('yyyy-MM-dd'))`nClient secret: shown once on screen, copied to clipboard, not stored here"
-    $summaryPath = Join-Path $InstallDir 'HST-Monitor-AppRegistration.txt'
+    $summary = "$GraphAppDisplayName app registration`nCreated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') on $SiteName`nTenant ID: $tenantId`nClient ID: $($app.appId)`nSender mailbox: $SenderAddress`nSecret expires: $($end.ToString('yyyy-MM-dd'))`nClient secret: shown once on screen, copied to clipboard, not stored here"
+    $summaryPath = Join-Path $InstallDir 'AppRegistration.txt'
     try { Set-Content -Path $summaryPath -Value $summary -Encoding UTF8; Write-Log -Level CREATED -Message "Saved summary (without secret) to $summaryPath." } catch { }
     try { Set-Clipboard -Value $secret } catch { }
 
@@ -971,7 +1012,7 @@ function Send-MailWithConfig {
 
 function Get-MailConfiguration {
     # Interactive mail wizard. Returns a hashtable with SmtpServer, SmtpPort, SmtpUseSsl, MailFrom, MailTo, MailMethod, SmtpAuthUser, CipherText.
-    param([object]$Saved, [Parameter(Mandatory)][string]$SiteName)
+    param([object]$Saved, [Parameter(Mandatory)][string]$SiteName, [string]$MonitorName)
 
     $defMethod = if ($Saved -and $Saved.MailMethod) { $Saved.MailMethod } else { $MailMethod }
     $defFrom   = if ($Saved -and $Saved.MailFrom)   { $Saved.MailFrom } else { $MailFrom }
@@ -1143,8 +1184,8 @@ function Get-MailConfiguration {
         $mail = @{ MailMethod = $method; SmtpServer = $server; SmtpPort = $port; SmtpUseSsl = $ssl; MailFrom = $from; MailTo = $to; SmtpAuthUser = $user; CipherText = $cipher; GraphTenantId = $tenant; GraphClientId = $client; GraphSecretExpires = $expiry }
 
         Write-Log -Level INFORMATIONAL -Message "Sending a test email from $from to $($to -join ', ') via $server`:$port (TLS=$ssl, method=$method)."
-        $testSubject = "[HST MONITOR TEST] $SiteName ($env:COMPUTERNAME)"
-        $testBody = New-AlertBody -Heading "Alert delivery test" -Details ([ordered]@{ 'Site' = $SiteName; 'Server' = $env:COMPUTERNAME; 'Mail method' = "$method via $server`:$port"; 'Sent' = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'); 'Result' = 'If you can read this, alert delivery from this server works.' }) -Footer "Sent by the HST eChart monitor installer on $env:COMPUTERNAME."
+        $testSubject = "[MONITOR TEST] $(Get-AlertLabel -MonitorName $MonitorName -SiteName $SiteName -HostName $env:COMPUTERNAME)"
+        $testBody = New-AlertBody -Heading "Alert delivery test" -Details ([ordered]@{ 'Monitor' = $MonitorName; 'Site' = $SiteName; 'Server' = $env:COMPUTERNAME; 'Mail method' = "$method via $server`:$port"; 'Sent' = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'); 'Result' = 'If you can read this, alert delivery from this server works.' }) -Footer "Sent by the curl monitor installer on $env:COMPUTERNAME."
         $sent = Send-MailWithConfig -Mail $mail -Subject $testSubject -Body $testBody -Credential $cred -GraphSecret $graphSecret
 
         if ($NonInteractive) {
@@ -1168,7 +1209,7 @@ function Get-MailConfiguration {
                 while ((Get-Date) -lt $deadline -and -not $ok) {
                     Write-Log -Level INFORMATIONAL -Message "Waiting $waitMinutes min without retrying. Next attempt at $((Get-Date).AddMinutes($waitMinutes).ToString('HH:mm'))."
                     Start-Sleep -Seconds ($waitMinutes * 60)
-                    $testBody = New-AlertBody -Heading "Alert delivery test" -Details ([ordered]@{ 'Site' = $SiteName; 'Server' = $env:COMPUTERNAME; 'Mail method' = "$method via $server`:$port"; 'Sent' = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'); 'Result' = 'If you can read this, alert delivery from this server works.' }) -Footer "Sent by the HST eChart monitor installer on $env:COMPUTERNAME."
+                    $testBody = New-AlertBody -Heading "Alert delivery test" -Details ([ordered]@{ 'Monitor' = $MonitorName; 'Site' = $SiteName; 'Server' = $env:COMPUTERNAME; 'Mail method' = "$method via $server`:$port"; 'Sent' = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'); 'Result' = 'If you can read this, alert delivery from this server works.' }) -Footer "Sent by the curl monitor installer on $env:COMPUTERNAME."
                     $ok = Send-MailWithConfig -Mail $mail -Subject $testSubject -Body $testBody -Credential $cred -GraphSecret $graphSecret
                     $waitMinutes = 10
                 }
@@ -1199,6 +1240,262 @@ function Get-MailConfiguration {
     }
 }
 
+function ConvertTo-MonitorSlug {
+    # Folder-safe form of the monitor name: letters, digits and dashes, no runs, no leading or trailing dash
+    param([string]$Name)
+    if ($null -eq $Name) { return "" }
+    $slug = ($Name -replace '[^A-Za-z0-9]+', '-').Trim('-')
+    if ($slug.Length -gt 60) { $slug = $slug.Substring(0, 60).Trim('-') }
+    return $slug
+}
+
+function Get-InstalledMonitor {
+    # Monitor names already installed under the root, read from each folder's saved settings
+    param([string]$Root = $InstallRoot)
+    $found = @()
+    if (-not (Test-Path $Root)) { return $found }
+    foreach ($dir in @(Get-ChildItem -Path $Root -Directory -ErrorAction SilentlyContinue)) {
+        $settingsPath = Join-Path $dir.FullName $SettingsFileName
+        if (-not (Test-Path $settingsPath)) { continue }
+        try {
+            $json = Get-Content -Path $settingsPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            $name = if ($json.MonitorName) { [string]$json.MonitorName } else { $dir.Name }
+            $found += [PSCustomObject]@{ Name = $name; Slug = $dir.Name; Path = $dir.FullName; Url = [string]$json.Url }
+        }
+        catch { $found += [PSCustomObject]@{ Name = $dir.Name; Slug = $dir.Name; Path = $dir.FullName; Url = '' } }
+    }
+    return $found
+}
+
+function Get-MonitorName {
+    # Returns the monitor name from the override, the only existing monitor, a legacy install, or a prompt
+    param([string]$SavedDefault = "", [object[]]$Existing = @())
+    if (-not [string]::IsNullOrWhiteSpace($MonitorNameOverride)) {
+        $clean = ConvertTo-SafeSiteName $MonitorNameOverride
+        if ($clean -and ($TaskNamePrefix + $clean).Length -gt $MaxTaskNameLength) {
+            Write-Log -Level FAILED -Message "Monitor name override '$clean' is too long for a task name."
+            return ""
+        }
+        if ($clean) { Write-Log -Level FOUND -Message "Monitor name set from override: '$clean'."; return $clean }
+    }
+    $default = $SavedDefault
+    if (-not $default) { $default = ConvertTo-SafeSiteName $MonitorName }
+    if (-not $default -and @($Existing).Count -eq 1) { $default = @($Existing)[0].Name }
+    if (-not $default -and @($Existing).Count -gt 1) { $default = @(@($Existing) | Sort-Object { (Get-Item $_.Path).LastWriteTime } -Descending)[0].Name }
+    if ($NonInteractive) {
+        $clean = ConvertTo-SafeSiteName $default
+        if (-not $clean) { Write-Log -Level FAILED -Message "No monitor name. Set `$MonitorNameOverride or `$MonitorName in the config block."; return "" }
+        if (($TaskNamePrefix + $clean).Length -gt $MaxTaskNameLength) { Write-Log -Level FAILED -Message "Monitor name '$clean' is too long for a task name."; return "" }
+        $clash = Get-SlugClash -Name $clean -Existing $Existing
+        if ($clash) {
+            Write-Log -Level WARNING -Message "'$clean' uses the same folder as the installed monitor '$($clash.Name)'. Upgrading that monitor instead of overwriting it."
+            return $clash.Name
+        }
+        Write-Log -Level FOUND -Message "Monitor name set to '$clean' (non-interactive)."
+        return $clean
+    }
+    if (@($Existing).Count -gt 0) {
+        Write-Log -Level FOUND -Message "Monitors already installed on this server: $((@($Existing) | ForEach-Object { "$($_.Name) -> $($_.Url)" }) -join '; ')."
+        Write-Log -Level INFORMATIONAL -Message "Type one of those names to upgrade it, or a new name to add another monitor beside it."
+    }
+    while ($true) {
+        Write-Log -Level PROMPT -Message "Name this monitor, for example 'HST eChart'. It names its folder, its task, and every alert subject."
+        $typed = Read-Setting -Prompt "Monitor name" -Default $default
+        $clean = ConvertTo-SafeSiteName $typed
+        if (-not $clean) { Write-Log -Level WARNING -Message "Monitor name cannot be empty after cleanup."; continue }
+        if (-not (ConvertTo-MonitorSlug $clean)) { Write-Log -Level WARNING -Message "Monitor name needs at least one letter or digit."; continue }
+        if (-not (Test-MonitorNameLength $clean)) { continue }
+        if ($clean -ne $typed.Trim()) {
+            if ((Read-Choice -Prompt "Cleaned to '$clean'. Use it?" -Allowed @('Y','N') -Default 'Y') -ne 'Y') { continue }
+        }
+        # Two names can clean to one folder ('HST eChart' and 'HST_eChart', or a case-only change). Adopting the
+        # installed name upgrades that monitor; anything else would overwrite its files while leaving its task behind.
+        $clash = Get-SlugClash -Name $clean -Existing $Existing
+        if ($clash) {
+            Write-Log -Level WARNING -Message "'$clean' uses the same folder as the installed monitor '$($clash.Name)' ($($clash.Path))."
+            $answer = Read-Choice -Prompt "U = upgrade '$($clash.Name)' in place, N = type another name" -Allowed @('U','N') -Default 'U'
+            if ($answer -ne 'U') { continue }
+            Write-Log -Level FOUND -Message "Upgrading the installed monitor '$($clash.Name)'."
+            return $clash.Name
+        }
+        Write-Log -Level FOUND -Message "Monitor '$clean' goes in '$(Join-Path $InstallRoot (ConvertTo-MonitorSlug $clean))'."
+        return $clean
+    }
+}
+
+function Test-MonitorNameLength {
+    # Task Scheduler rejects a name past 238 characters, so the wizard refuses one before anything is written
+    param([Parameter(Mandatory)][string]$Name)
+    if (($TaskNamePrefix + $Name).Length -le $MaxTaskNameLength) { return $true }
+    $max = [math]::Max(1, $MaxTaskNameLength - $TaskNamePrefix.Length)
+    Write-Log -Level WARNING -Message "Monitor name is too long. Keep it to $max characters or fewer, so the task name '$TaskNamePrefix<name>' stays inside the Task Scheduler limit."
+    return $false
+}
+
+function Get-SlugClash {
+    # The installed monitor whose folder this name would land in, when that monitor goes by another name
+    param([Parameter(Mandatory)][string]$Name, [object[]]$Existing = @())
+    $slug = ConvertTo-MonitorSlug $Name
+    foreach ($m in @($Existing)) {
+        # Slugs match case-insensitively the way NTFS does; a name that differs only in case still has to adopt
+        # the installed spelling, or the folder and the task would drift apart.
+        if ($m.Slug -and $m.Slug -eq $slug -and $m.Name -cne $Name) { return $m }
+    }
+    return $null
+}
+
+function Test-MonitorUrl {
+    # True for an absolute http or https URL
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+    $u = $null
+    if (-not [uri]::TryCreate($Text.Trim(), [UriKind]::Absolute, [ref]$u)) { return $false }
+    return ($u.Scheme -eq 'http' -or $u.Scheme -eq 'https')
+}
+
+function Get-MonitorUrl {
+    # Returns the URL to watch from the config block, saved settings, or a prompt
+    param([string]$SavedDefault = "")
+    # A silent re-deploy has to be able to repoint a monitor, so the config block wins over the saved value there
+    $default = if ($NonInteractive -and (Test-MonitorUrl $Url)) { $Url } elseif ($SavedDefault) { $SavedDefault } elseif (Test-MonitorUrl $Url) { $Url } else { "" }
+    if ($NonInteractive) {
+        if (Test-MonitorUrl $default) { Write-Log -Level FOUND -Message "URL set to '$default' (non-interactive)."; return $default.Trim() }
+        Write-Log -Level FAILED -Message "No valid URL. Set `$Url in the config block."
+        return ""
+    }
+    while ($true) {
+        Write-Log -Level PROMPT -Message "Enter the URL this monitor watches. curl.exe requests it every $IntervalSeconds s and follows up to $MaxRedirects redirects."
+        $typed = Read-Setting -Prompt "URL" -Default $default
+        if (Test-MonitorUrl $typed) { Write-Log -Level FOUND -Message "Watching '$($typed.Trim())'."; return $typed.Trim() }
+        Write-Log -Level WARNING -Message "Enter a full URL starting with http:// or https://."
+    }
+}
+
+function Get-ContentMarker {
+    # Returns the text that must appear on the page, or an empty string to check only the status and the size
+    param([string]$SavedDefault = "")
+    if ($NonInteractive) { return [string]$(if ($ExpectedContentMarker) { $ExpectedContentMarker } elseif ($SavedDefault) { $SavedDefault } else { '' }) }
+    $default = if ($SavedDefault) { $SavedDefault } else { $ExpectedContentMarker }
+    if ($default) {
+        Write-Log -Level PROMPT -Message "Text that must appear on the page for the poll to count as healthy. Enter keeps '$default'. Type - to drop the text check, so a healthy poll is HTTP 200 with at least $MinPopulatedBytes bytes."
+        $label = "Required text (Enter = keep '$default', - = no text check)"
+    }
+    else {
+        Write-Log -Level PROMPT -Message "Text that must appear on the page for the poll to count as healthy, for example a title. Leave blank to check only the HTTP status and that the page is at least $MinPopulatedBytes bytes."
+        $label = "Required text (blank for none)"
+    }
+    $typed = Read-Setting -Prompt $label -Default $default
+    $typed = "$typed".Trim()
+    if ($typed -eq '-') { $typed = '' }
+    if ($typed) { Write-Log -Level FOUND -Message "A healthy poll must contain '$typed'." }
+    else { Write-Log -Level FOUND -Message "No text check. A healthy poll is HTTP 200 with at least $MinPopulatedBytes bytes." }
+    return $typed
+}
+
+function Get-LegacyInstall {
+    # Finds an older HST-only install, returning its folder, task, and saved settings, or $null
+    param([string]$Dir = $LegacyInstallDir, [string]$TaskName = $LegacyTaskName, [string]$Path = $TaskPath)
+    $settingsPath = Join-Path $Dir $SettingsFileName
+    $task = Get-ScheduledTask -TaskName $TaskName -TaskPath $Path -ErrorAction SilentlyContinue
+    $hasFiles = (Test-Path $settingsPath) -or (Test-Path (Join-Path $Dir 'Watch-HSTeChartUptime.ps1'))
+    if (-not $hasFiles -and -not $task) { return $null }
+    $settings = $null
+    if (Test-Path $settingsPath) {
+        try { $settings = Get-Content -Path $settingsPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { }
+    }
+    return [PSCustomObject]@{
+        Dir       = $Dir
+        TaskName  = $TaskName
+        TaskPath  = $Path
+        HasTask   = [bool]$task
+        Settings  = $settings
+        Url       = [string]$(if ($settings -and $settings.Url) { $settings.Url } else { '' })
+        SiteName  = [string]$(if ($settings -and $settings.SiteName) { $settings.SiteName } else { '' })
+    }
+}
+
+function Invoke-LegacyMigration {
+    # Moves an older HST-only install into the per-monitor layout: stops and unregisters its task, copies its
+    # history under the new names, verifies every copy, then removes the old folder. Returns $true when the old
+    # folder is gone. On any copy problem the old folder is left alone and reported.
+    param([Parameter(Mandatory)][object]$Legacy, [Parameter(Mandatory)][string]$Destination)
+    if ($Legacy.HasTask) {
+        try {
+            Stop-ScheduledTask -TaskName $Legacy.TaskName -TaskPath $Legacy.TaskPath -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+            Unregister-ScheduledTask -TaskName $Legacy.TaskName -TaskPath $Legacy.TaskPath -Confirm:$false -ErrorAction Stop
+            Write-Log -Level INFORMATIONAL -Message "Stopped and removed the old task '$($Legacy.TaskPath)$($Legacy.TaskName)'."
+        }
+        catch { Write-Log -Level WARNING -Message "Could not remove the old task '$($Legacy.TaskPath)$($Legacy.TaskName)'. Remove it by hand or it keeps polling. $($_.Exception.Message)" }
+    }
+    if (-not (Test-Path $Legacy.Dir)) { return $true }
+    $copied = 0; $failed = 0; $kept = 0
+    foreach ($file in @(Get-ChildItem -Path $Legacy.Dir -File -Force -Recurse -ErrorAction SilentlyContinue)) {
+        $target = switch -Regex ($file.Name) {
+            '^HST-eChart-Latency_(.+)\.csv$'  { "Latency_$($Matches[1]).csv" ; break }
+            '^HST-eChart-Outages\.csv$'       { 'Outages.csv' ; break }
+            '^HST-eChart-Drops\.log$'         { 'Drops.log' ; break }
+            '^HST-eChart-Drops_(.+)\.log$'    { "Drops_$($Matches[1]).log" ; break }
+            '^HST-eChart-Monitor_(.+)\.log$'  { "Transcript_$($Matches[1]).log" ; break }
+            '^monitor-heartbeat\.json$'       { 'heartbeat.json' ; break }
+            '^smtp-credential\.bin$'          { $CredentialFileName ; break }
+            '^daily-summary-sent\.txt$'       { 'summary-sent.txt' ; break }
+            '^install-settings\.json$'        { $SettingsFileName ; break }
+            '^HST-Monitor-AppRegistration\.txt$' { 'AppRegistration.txt' ; break }
+            default { '' }
+        }
+        # Anything unrecognised, including files in subfolders, is carried under its own name rather than deleted
+        $relative = $file.FullName.Substring($Legacy.Dir.Length).TrimStart('\')
+        if (-not $target) { $target = 'legacy-' + ($relative -replace '[\\/]', '-') }
+        $targetPath = Join-Path $Destination $target
+        # Never write over history the new monitor has already recorded: a second migration must not roll it back
+        $existing = Get-Item -LiteralPath $targetPath -Force -ErrorAction SilentlyContinue
+        if ($existing) {
+            if ($existing.Length -eq $file.Length -and $existing.LastWriteTimeUtc -ge $file.LastWriteTimeUtc) { $kept++; continue }
+            $targetPath = Join-Path $Destination ("legacy-" + (Get-Date -Format 'yyyyMMdd_HHmmss') + "-" + $target)
+            Write-Log -Level INFORMATIONAL -Message "'$target' already exists here, so '$($file.Name)' came in as '$(Split-Path $targetPath -Leaf)'."
+        }
+        try {
+            Copy-Item -LiteralPath $file.FullName -Destination $targetPath -Force -ErrorAction Stop
+            # -Force on Get-Item so a hidden file, which Test-Path skips, still verifies
+            $landed = Get-Item -LiteralPath $targetPath -Force -ErrorAction SilentlyContinue
+            if (-not $landed -or $landed.Length -ne $file.Length) { throw "copy is not the same size" }
+            if ((Split-Path $targetPath -Leaf) -eq $CredentialFileName) {
+                # The stored secret arrives with inherited permissions, so lock it before any prompt can abort the run
+                & icacls.exe "$targetPath" /inheritance:r /grant:r "*S-1-5-18:(F)" "*S-1-5-32-544:(F)" | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "icacls could not restrict the carried credential file (exit $LASTEXITCODE)" }
+            }
+            $copied++
+        }
+        catch { $failed++; Write-Log -Level WARNING -Message "Could not carry '$($file.Name)' over. $($_.Exception.Message)" }
+    }
+    Write-Log -Level CREATED -Message "Carried $copied file(s) from '$($Legacy.Dir)' into '$Destination'$(if ($kept) { ", left $kept already here alone" } else { '' })."
+    # The old monitor was stopped on purpose, so mark the heartbeat: no restart notice, any outage still carries over
+    $hb = Join-Path $Destination 'heartbeat.json'
+    if (Test-Path $hb) {
+        try {
+            $doc = Get-Content -Path $hb -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            $doc | Add-Member -NotePropertyName Stopped -NotePropertyValue $true -Force
+            $doc | ConvertTo-Json -Compress | Set-Content -Path $hb -Encoding UTF8 -Force
+        }
+        catch { Remove-Item -Path $hb -Force -ErrorAction SilentlyContinue }
+    }
+    try { Add-Content -Path (Join-Path $Destination 'Drops.log') -Value ("{0} | {1,-9} | {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), 'STOP', "Monitor stopped by the installer on $env:COMPUTERNAME and moved to '$Destination'.") -Encoding UTF8 -ErrorAction Stop } catch { }
+    if ($failed -gt 0) {
+        Write-Log -Level WARNING -Message "$failed file(s) did not copy, so '$($Legacy.Dir)' is left in place. Move what you need by hand and delete it when you are done."
+        return $false
+    }
+    try {
+        Remove-Item -Path $Legacy.Dir -Recurse -Force -ErrorAction Stop
+        Write-Log -Level INFORMATIONAL -Message "Removed the old folder '$($Legacy.Dir)'."
+        return $true
+    }
+    catch {
+        Write-Log -Level WARNING -Message "History was carried over but '$($Legacy.Dir)' could not be removed. Delete it by hand. $($_.Exception.Message)"
+        return $false
+    }
+}
+
 function New-MonitorContent {
     # Builds the monitor script text from the embedded template with values baked in. One regex pass over the
     # template means a value that happens to contain a token is inserted as-is, never substituted again.
@@ -1212,6 +1509,7 @@ function New-MonitorContent {
 
     $values = @{
         SITENAME        = (& $q $SiteName)
+        MONITORNAME     = (& $q $MonitorName)
         URL             = (& $q $Url)
         INSTALLDIR      = (& $q $InstallDir)
         CREDFILE        = (& $q $CredentialFileName)
@@ -1220,6 +1518,7 @@ function New-MonitorContent {
         MAXREDIRS       = [string][math]::Max(0, [int]$MaxRedirects)
         MARKER          = (& $q $ExpectedContentMarker)
         MINBYTES        = [string][math]::Max(1, [int]$MinPopulatedBytes)
+        MAXBODYBYTES    = [string][math]::Max([math]::Max(1048576, 4 * [int]$MinPopulatedBytes), [int64]$MaxBodyBytes)
         SLOWMS          = [string][math]::Max(0, [int]$SlowThresholdMs)
         ALERTONSLOW     = (& $b $AlertOnSlow)
         SLOWWINDOW      = [string][math]::Max(1, [int]$SlowWindowMinutes)
@@ -1249,7 +1548,7 @@ function New-MonitorContent {
 function Test-EndpointReachable {
     # One-shot reachability check used at install time. Follows redirects exactly as the monitor does.
     $format = 'CODE=%{http_code}\nREDIRECTS=%{num_redirects}\nFINAL=%{url_effective}'
-    $lines = @(& curl.exe -s -L --max-redirs $MaxRedirects -o NUL -A "CSP-HST-Latency-Probe/1.0 (DIT)" -H "Cache-Control: no-cache" -w $format --max-time $TimeoutSeconds $Url 2>$null)
+    $lines = @(& curl.exe -s -L --max-redirs $MaxRedirects -o NUL -A "CurlMonitor/1.0 (DIT)" -H "Cache-Control: no-cache" -w $format --max-time $TimeoutSeconds $Url 2>$null)
     $code = $null; $redirects = $null; $final = $null
     foreach ($line in $lines) {
         if ($line -match '^CODE=(\d{3})$') { $code = $Matches[1] }
@@ -1272,17 +1571,17 @@ function Wait-TaskStopped {
 $Template_MonitorScript = @'
 <#
 .SYNOPSIS
-    Continuous latency, availability, and timeout monitor for the Compass HST eChart endpoint.
+    Continuous latency, availability, and timeout monitor for one URL.
 
 .DESCRIPTION
-    Deployed by Install-HSTMonitor.ps1. Runs continuously as SYSTEM on one on-prem server per site.
+    Deployed by Install-CurlMonitor.ps1. Runs continuously as SYSTEM, one instance per monitored URL.
     1. Validates curl.exe and the output folder, starts a daily transcript log, and prunes old logs.
     2. Probes the endpoint every interval, following redirects to the sign-in page, and captures DNS, connect,
        TLS, TTFB, redirect, and total timings plus HTTP code, redirect count, final URL, size, answering backend
        IP, and the curl exit code with a plain-English reason.
     3. Confirms the sign-in page populated: the content marker is present and the body meets the minimum size.
     4. Appends one timestamped row (local and UTC) to a monthly CSV on every poll, and writes failed or slow polls,
-       outage transitions, alert delivery problems, and starts and restarts to HST-eChart-Drops.log, never a healthy poll.
+       outage transitions, alert delivery problems, and starts and restarts to Drops.log, never a healthy poll.
     5. Tracks up and down state with true outage onset, alerts on state change with the site in the subject,
        re-alerts while still down, and on recovery emails the outage duration and writes an outage record.
        Short of an outage, it emails SLOW when most polls over a rolling window are slow or failing, re-alerts
@@ -1302,25 +1601,26 @@ $Template_MonitorScript = @'
     Author:      Christopher Carroll
     Created:     09/04/2026
     Idempotency: Safe to run repeatedly. Each poll appends one row and never modifies prior rows.
-    Context:     Generated file. Edit the template in Install-HSTMonitor.ps1 and re-run the installer, do not
+    Context:     Generated file. Edit the template in Install-CurlMonitor.ps1 and re-run the installer, do not
                  hand-edit this deployed copy. Runs headless, so it never auto-opens any file.
 
 .LINK
-    https://prodasp09.hstpathways.com/p95_CSP/HSTeChart
+    https://curl.se/docs/manpage.html
 #>
 
 Remove-Variable * -ErrorAction SilentlyContinue
 
-# Site and endpoint
+# What this monitor watches
+$MonitorName           = '@@MONITORNAME@@'
 $SiteName              = '@@SITENAME@@'
 $Url                   = '@@URL@@'
 
 # Output locations
 $InstallDir            = '@@INSTALLDIR@@'
-$OutageCsv             = '@@INSTALLDIR@@\HST-eChart-Outages.csv'
-$HeartbeatFile         = '@@INSTALLDIR@@\monitor-heartbeat.json'
-$DropLog               = '@@INSTALLDIR@@\HST-eChart-Drops.log'
-$SummaryStateFile      = '@@INSTALLDIR@@\daily-summary-sent.txt'
+$OutageCsv             = '@@INSTALLDIR@@\Outages.csv'
+$HeartbeatFile         = '@@INSTALLDIR@@\heartbeat.json'
+$DropLog               = '@@INSTALLDIR@@\Drops.log'
+$SummaryStateFile      = '@@INSTALLDIR@@\summary-sent.txt'
 $LogRetentionDays      = @@RETENTIONDAYS@@
 
 # Probe behavior
@@ -1329,6 +1629,7 @@ $TimeoutSeconds        = @@TIMEOUT@@
 $MaxRedirects          = @@MAXREDIRS@@
 $ExpectedContentMarker = '@@MARKER@@'
 $MinPopulatedBytes     = @@MINBYTES@@
+$MaxBodyBytes          = @@MAXBODYBYTES@@
 $SlowThresholdMs       = @@SLOWMS@@
 
 # Alerting behavior
@@ -1413,6 +1714,7 @@ function Get-CurlReason {
         35 { return 'TLS handshake failed' }
         47 { return 'Too many redirects' }
         52 { return 'Empty reply from server' }
+        63 { return 'Response larger than the size limit' }
         55 { return 'Send failed' }
         60 { return 'TLS certificate not trusted' }
         56 { return 'Connection reset during receive' }
@@ -1422,7 +1724,7 @@ function Get-CurlReason {
 
 function Get-LatencyCsvPath {
     # Monthly latency file so no single CSV grows without bound
-    return (Join-Path $InstallDir ("HST-eChart-Latency_" + (Get-Date -Format 'yyyyMM') + ".csv"))
+    return (Join-Path $InstallDir ("Latency_" + (Get-Date -Format 'yyyyMM') + ".csv"))
 }
 
 function Write-CsvRow {
@@ -1450,7 +1752,7 @@ function Write-CsvRow {
 }
 
 function Get-TranscriptPath {
-    return (Join-Path $InstallDir ("HST-eChart-Monitor_" + (Get-Date -Format 'yyyyMMdd') + ".log"))
+    return (Join-Path $InstallDir ("Transcript_" + (Get-Date -Format 'yyyyMMdd') + ".log"))
 }
 
 function Update-TranscriptIfDayChanged {
@@ -1462,7 +1764,7 @@ function Update-TranscriptIfDayChanged {
     Start-Transcript -Path $wanted -Append | Out-Null
     Write-Log -Level INFORMATIONAL -Message "Rolled transcript to '$wanted'."
     $cutoff = (Get-Date).AddDays(-$LogRetentionDays)
-    Get-ChildItem -Path $InstallDir -Filter 'HST-eChart-Monitor_*.log' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt $cutoff } | Remove-Item -Force -ErrorAction SilentlyContinue
+    Get-ChildItem -Path $InstallDir -Filter 'Transcript_*.log' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt $cutoff } | Remove-Item -Force -ErrorAction SilentlyContinue
     return $wanted
 }
 
@@ -1504,7 +1806,7 @@ function Get-SmtpCredential {
 
 function New-AlertBody {
     # Builds a compact HTML body: a heading, a two-column table of details, and a footer naming the sending server
-    param([Parameter(Mandatory)][string]$Heading, [Parameter(Mandatory)][System.Collections.IDictionary]$Details, [string]$Footer = "Sent by the HST eChart monitor on $env:COMPUTERNAME.")
+    param([Parameter(Mandatory)][string]$Heading, [Parameter(Mandatory)][System.Collections.IDictionary]$Details, [string]$Footer = "Sent by the curl monitor on $env:COMPUTERNAME.")
     $enc = { param($s) [System.Net.WebUtility]::HtmlEncode([string]$s) }
     $rows = foreach ($k in $Details.Keys) { "<tr><td style='padding:3px 16px 3px 0;color:#555;white-space:nowrap;vertical-align:top'>$(& $enc $k)</td><td style='padding:3px 0'>$(& $enc $Details[$k])</td></tr>" }
     return "<html><body style='font-family:Segoe UI,Arial,sans-serif;font-size:14px;color:#222'><p style='font-size:16px;font-weight:600;margin:0 0 10px'>$(& $enc $Heading)</p><table style='border-collapse:collapse'>$($rows -join '')</table><p style='margin:14px 0 0;color:#777;font-size:12px'>$(& $enc $Footer)</p></body></html>"
@@ -1548,12 +1850,12 @@ function Get-SecretExpiryWarning {
     $d = [datetime]::MinValue
     if (-not [datetime]::TryParseExact($ExpiresOn, 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$d)) { return $null }
     $days = [int]($d.Date - $Today.Date).TotalDays
-    if ($days -lt 0)  { return "Graph client secret EXPIRED on $ExpiresOn. Alerts are not being delivered. Re-run Install-HSTMonitor.ps1 and choose N at the app registration prompt to mint a new secret." }
-    if ($days -le 30) { return "Graph client secret expires in $days day(s) on $ExpiresOn. Re-run Install-HSTMonitor.ps1 and choose N at the app registration prompt to mint a new secret." }
+    if ($days -lt 0)  { return "Graph client secret EXPIRED on $ExpiresOn. Alerts are not being delivered. Re-run Install-CurlMonitor.ps1 and choose N at the app registration prompt to mint a new secret." }
+    if ($days -le 30) { return "Graph client secret expires in $days day(s) on $ExpiresOn. Re-run Install-CurlMonitor.ps1 and choose N at the app registration prompt to mint a new secret." }
     return $null
 }
 
-function Get-HSTProbeResult {
+function Get-ProbeResult {
     # Runs one timed request, following redirects to the sign-in page the way a browser would. stderr is discarded so parsing stays clean.
     # The body lands in the install folder, not the global temp folder, and is removed after the size and marker checks.
     $tempBody = Join-Path $InstallDir 'probe-body.tmp'
@@ -1561,7 +1863,7 @@ function Get-HSTProbeResult {
     $lines = @()
     $exit = -1
     try {
-        $lines = @(& curl.exe -s -L --max-redirs $MaxRedirects -A "CSP-HST-Latency-Probe/1.0 (DIT)" -H "Cache-Control: no-cache" -o $tempBody -w $format --max-time $TimeoutSeconds $Url 2>$null)
+        $lines = @(& curl.exe -s -L --max-redirs $MaxRedirects -A "CurlMonitor/1.0 (DIT)" -H "Cache-Control: no-cache" -o $tempBody -w $format --max-time $TimeoutSeconds --max-filesize $MaxBodyBytes $Url 2>$null)
         $exit = $LASTEXITCODE
     }
     catch {
@@ -1579,9 +1881,12 @@ function Get-HSTProbeResult {
     $markerOk = $true
     try {
         if (Test-Path $tempBody) {
-            $sizeOk = ((Get-Item $tempBody).Length -ge $MinPopulatedBytes)
+            $bodyBytes = (Get-Item $tempBody).Length
+            $sizeOk = ($bodyBytes -ge $MinPopulatedBytes)
             if (-not [string]::IsNullOrWhiteSpace($ExpectedContentMarker)) {
-                $markerOk = [bool](Select-String -Path $tempBody -SimpleMatch -Pattern $ExpectedContentMarker -Quiet)
+                # An oversized body is never loaded: curl stops at MaxBodyBytes, and a file past it is not scanned
+                if ($bodyBytes -gt $MaxBodyBytes) { $markerOk = $false }
+                else { $markerOk = [bool](Select-String -Path $tempBody -SimpleMatch -Pattern $ExpectedContentMarker -Quiet) }
             }
         }
     }
@@ -1619,6 +1924,14 @@ function Get-HSTProbeResult {
     }
 }
 
+function Get-AlertLabel {
+    # "{Monitor} at {Site} ({HOST})" for subjects, dropping any part that is not set
+    param([string]$MonitorName, [string]$SiteName, [string]$HostName)
+    $label = if ($MonitorName -and $SiteName) { "$MonitorName at $SiteName" } elseif ($MonitorName) { $MonitorName } else { $SiteName }
+    if ($HostName) { return "$label ($HostName)" }
+    return $label
+}
+
 function Update-MonitorState {
     # Pure state transition. No side effects. Returns new state plus any email, outage record, and transition log.
     param(
@@ -1631,11 +1944,13 @@ function Update-MonitorState {
         [bool]$AlertOnRecovery,
         [string]$SiteName,
         [string]$Url,
-        [string]$HostName
+        [string]$HostName,
+        [string]$MonitorName
     )
 
     if ($DownThreshold -lt 1) { $DownThreshold = 1 }
-    $siteLabel = if ($HostName) { "$SiteName ($HostName)" } else { $SiteName }
+    $siteLabel = Get-AlertLabel -MonitorName $MonitorName -SiteName $SiteName -HostName $HostName
+    $what = if ($MonitorName) { $MonitorName } else { 'The endpoint' }
 
     $s = @{
         ConsecutiveFailures = [int]$State.ConsecutiveFailures
@@ -1663,16 +1978,16 @@ function Update-MonitorState {
             $s.LastAlertUtc   = $NowUtc
             $s.AlertDelivered = $false
             $emailKind        = 'Down'
-            $emailSubject     = "[HST DOWN] $siteLabel - HST eChart unreachable"
-            $emailBody      = New-AlertBody -Heading "HST eChart is unreachable from $SiteName" -Details ([ordered]@{ 'Status' = 'DOWN'; 'Site' = $SiteName; 'Server' = $HostName; 'Endpoint' = $Url; 'Outage started' = "$($s.OutageStartLocalStr) local ($($s.OutageStartUtcStr) UTC)"; 'Failed polls' = $s.ConsecutiveFailures; 'Last HTTP code' = $Result.HttpCode; 'Reason' = $reason; 'Page populated' = $Result.ContentOk; 'Backend IP' = $Result.RemoteIp })
+            $emailSubject     = "[DOWN] $siteLabel - unreachable"
+            $emailBody      = New-AlertBody -Heading "$what is unreachable from $SiteName" -Details ([ordered]@{ 'Status' = 'DOWN'; 'Site' = $SiteName; 'Server' = $HostName; 'Endpoint' = $Url; 'Outage started' = "$($s.OutageStartLocalStr) local ($($s.OutageStartUtcStr) UTC)"; 'Failed polls' = $s.ConsecutiveFailures; 'Last HTTP code' = $Result.HttpCode; 'Reason' = $reason; 'Page populated' = $Result.ContentOk; 'Backend IP' = $Result.RemoteIp })
             $transitionLog  = "Declared DOWN for $SiteName after $($s.ConsecutiveFailures) consecutive failures ($reason)."
         }
         elseif ($s.IsDown -and ($ReAlertMinutes -gt 0) -and ($null -ne $s.LastAlertUtc) -and (($NowUtc - $s.LastAlertUtc).TotalMinutes -ge $ReAlertMinutes)) {
             $s.LastAlertUtc = $NowUtc
             $elapsed        = Format-Duration ($NowUtc - $s.OutageStartUtc)
             $emailKind      = 'Reminder'
-            $emailSubject   = "[HST STILL DOWN] $siteLabel - down for $elapsed"
-            $emailBody      = New-AlertBody -Heading "HST eChart is still unreachable from $SiteName" -Details ([ordered]@{ 'Status' = 'STILL DOWN'; 'Site' = $SiteName; 'Server' = $HostName; 'Endpoint' = $Url; 'Outage started' = "$($s.OutageStartLocalStr) local ($($s.OutageStartUtcStr) UTC)"; 'Down for' = $elapsed; 'Failed polls' = $s.ConsecutiveFailures; 'Last HTTP code' = $Result.HttpCode; 'Reason' = $reason; 'Backend IP' = $Result.RemoteIp; 'Earlier alerts' = $deliveryNote })
+            $emailSubject   = "[STILL DOWN] $siteLabel - down for $elapsed"
+            $emailBody      = New-AlertBody -Heading "$what is still unreachable from $SiteName" -Details ([ordered]@{ 'Status' = 'STILL DOWN'; 'Site' = $SiteName; 'Server' = $HostName; 'Endpoint' = $Url; 'Outage started' = "$($s.OutageStartLocalStr) local ($($s.OutageStartUtcStr) UTC)"; 'Down for' = $elapsed; 'Failed polls' = $s.ConsecutiveFailures; 'Last HTTP code' = $Result.HttpCode; 'Reason' = $reason; 'Backend IP' = $Result.RemoteIp; 'Earlier alerts' = $deliveryNote })
             $transitionLog  = "Reminder raised for $SiteName, down for $elapsed."
         }
     }
@@ -1696,8 +2011,8 @@ function Update-MonitorState {
             }
             if ($AlertOnRecovery) {
                 $emailKind    = 'Resolved'
-                $emailSubject = "[HST RESOLVED] $siteLabel - outage lasted $duration"
-                $emailBody    = New-AlertBody -Heading "HST eChart is reachable again from $SiteName" -Details ([ordered]@{ 'Status' = 'RESOLVED'; 'Site' = $SiteName; 'Server' = $HostName; 'Endpoint' = $Url; 'Outage started' = "$($s.OutageStartLocalStr) local ($($s.OutageStartUtcStr) UTC)"; 'Outage ended' = "$($Result.Timestamp_Local) local ($($Result.Timestamp_UTC) UTC)"; 'Duration' = $duration; 'Failed polls' = $s.ConsecutiveFailures; 'Recovery HTTP code' = $Result.HttpCode; 'Backend IP' = $Result.RemoteIp; 'DOWN alert' = $deliveryNote })
+                $emailSubject = "[RESOLVED] $siteLabel - outage lasted $duration"
+                $emailBody    = New-AlertBody -Heading "$what is reachable again from $SiteName" -Details ([ordered]@{ 'Status' = 'RESOLVED'; 'Site' = $SiteName; 'Server' = $HostName; 'Endpoint' = $Url; 'Outage started' = "$($s.OutageStartLocalStr) local ($($s.OutageStartUtcStr) UTC)"; 'Outage ended' = "$($Result.Timestamp_Local) local ($($Result.Timestamp_UTC) UTC)"; 'Duration' = $duration; 'Failed polls' = $s.ConsecutiveFailures; 'Recovery HTTP code' = $Result.HttpCode; 'Backend IP' = $Result.RemoteIp; 'DOWN alert' = $deliveryNote })
             }
             $transitionLog = "Outage record written: $SiteName lasted $duration over $($s.ConsecutiveFailures) failed polls."
             $s.IsDown = $false
@@ -1732,10 +2047,12 @@ function Update-SlowState {
         [bool]$AlertOnRecovery = $true,
         [string]$SiteName,
         [string]$Url,
-        [string]$HostName
+        [string]$HostName,
+        [string]$MonitorName
     )
     $WindowMinutes = [math]::Max(1, $WindowMinutes)
-    $siteLabel = if ($HostName) { "$SiteName ($HostName)" } else { $SiteName }
+    $siteLabel = Get-AlertLabel -MonitorName $MonitorName -SiteName $SiteName -HostName $HostName
+    $what = if ($MonitorName) { $MonitorName } else { 'The endpoint' }
     $s = @{
         Samples        = New-Object System.Collections.ArrayList
         IsSlow         = [bool]$State.IsSlow
@@ -1750,7 +2067,11 @@ function Update-SlowState {
     }
     $emailKind = $null; $emailSubject = $null; $emailBody = $null; $transitionLog = $null; $dropKind = $null
     $windowStart = $NowUtc.AddMinutes(-$WindowMinutes)
-    foreach ($x in @($State.Samples)) { if ($x -and $x.Utc -gt $windowStart) { [void]$s.Samples.Add($x) } }
+    # A clock that steps back leaves samples and timestamps in the future. Drop them and pull the period back to now,
+    # or the window never reads as covered again and the period can neither remind nor clear.
+    foreach ($x in @($State.Samples)) { if ($x -and $x.Utc -gt $windowStart -and $x.Utc -le $NowUtc) { [void]$s.Samples.Add($x) } }
+    if ($s.StartUtc -and $s.StartUtc -gt $NowUtc) { $s.StartUtc = $NowUtc }
+    if ($s.LastAlertUtc -and $s.LastAlertUtc -gt $NowUtc) { $s.LastAlertUtc = $NowUtc }
     $closePeriod = { $s.IsSlow = $false; $s.StartUtc = $null; $s.StartLocalStr = $null; $s.LastAlertUtc = $null; $s.Polls = 0; $s.SlowPolls = 0; $s.FailedPolls = 0; $s.WorstMs = 0; $s.AlertDelivered = $null }
 
     if ($IsDown) {
@@ -1799,8 +2120,8 @@ function Update-SlowState {
             $dropKind = 'SLOWCLEAR'
             if ($AlertOnRecovery) {
                 $emailKind = 'SlowResolved'
-                $emailSubject = "[HST SLOW RESOLVED] $siteLabel - slow period lasted $duration"
-                $emailBody = New-AlertBody -Heading "HST eChart is responding normally again from $SiteName" -Details ([ordered]@{ 'Status' = 'SLOW RESOLVED'; 'Site' = $SiteName; 'Server' = $HostName; 'Endpoint' = $Url; 'Slow from' = "$($s.StartLocalStr) local"; 'Normal from' = "$normalLocal local"; 'Duration' = $duration; 'Polls while slow' = "${pollsWhileSlow}: $($s.SlowPolls) slower than $SlowThresholdMs ms, $($s.FailedPolls) failed"; 'Worst response' = "$($s.WorstMs) ms"; 'Last poll' = $lastPoll; 'SLOW alert' = $deliveryNote })
+                $emailSubject = "[SLOW RESOLVED] $siteLabel - slow period lasted $duration"
+                $emailBody = New-AlertBody -Heading "$what is responding normally again from $SiteName" -Details ([ordered]@{ 'Status' = 'SLOW RESOLVED'; 'Site' = $SiteName; 'Server' = $HostName; 'Endpoint' = $Url; 'Slow from' = "$($s.StartLocalStr) local"; 'Normal from' = "$normalLocal local"; 'Duration' = $duration; 'Polls while slow' = "${pollsWhileSlow}: $($s.SlowPolls) slower than $SlowThresholdMs ms, $($s.FailedPolls) failed"; 'Worst response' = "$($s.WorstMs) ms"; 'Last poll' = $lastPoll; 'SLOW alert' = $deliveryNote })
             }
             & $closePeriod
         }
@@ -1808,8 +2129,8 @@ function Update-SlowState {
             $s.LastAlertUtc = $NowUtc
             $elapsed = Format-Duration ($NowUtc - $s.StartUtc)
             $emailKind = 'SlowReminder'
-            $emailSubject = "[HST STILL SLOW] $siteLabel - slow for $elapsed"
-            $emailBody = New-AlertBody -Heading "HST eChart is still slow from $SiteName" -Details ([ordered]@{ 'Status' = 'STILL SLOW'; 'Site' = $SiteName; 'Server' = $HostName; 'Endpoint' = $Url; 'Slow since' = "$($s.StartLocalStr) local"; 'Slow for' = $elapsed; 'Polls while slow' = "$($s.Polls): $($s.SlowPolls) slower than $SlowThresholdMs ms, $($s.FailedPolls) failed"; 'Worst response' = "$($s.WorstMs) ms"; "Last $WindowMinutes min" = "$windowText, $timing"; 'Last poll' = $lastPoll; 'Earlier alerts' = $deliveryNote })
+            $emailSubject = "[STILL SLOW] $siteLabel - slow for $elapsed"
+            $emailBody = New-AlertBody -Heading "$what is still slow from $SiteName" -Details ([ordered]@{ 'Status' = 'STILL SLOW'; 'Site' = $SiteName; 'Server' = $HostName; 'Endpoint' = $Url; 'Slow since' = "$($s.StartLocalStr) local"; 'Slow for' = $elapsed; 'Polls while slow' = "$($s.Polls): $($s.SlowPolls) slower than $SlowThresholdMs ms, $($s.FailedPolls) failed"; 'Worst response' = "$($s.WorstMs) ms"; "Last $WindowMinutes min" = "$windowText, $timing"; 'Last poll' = $lastPoll; 'Earlier alerts' = $deliveryNote })
             $transitionLog = "Reminder raised for $SiteName, slow for $elapsed."
             $dropKind = 'SLOWSTILL'
         }
@@ -1821,13 +2142,15 @@ function Update-SlowState {
         $s.StartLocalStr = $first.LocalStr
         $s.LastAlertUtc = $NowUtc
         $s.AlertDelivered = $false
-        $s.Polls = $total
-        $s.SlowPolls = $slowCount
-        $s.FailedPolls = $failedCount
+        # Counters start where the period starts, so the totals never include the healthy polls before it
+        $fromFirst = @($s.Samples | Where-Object { $_.Utc -ge $first.Utc })
+        $s.Polls = $fromFirst.Count
+        $s.SlowPolls = @($fromFirst | Where-Object { $_.Slow }).Count
+        $s.FailedPolls = @($fromFirst | Where-Object { $_.Failed }).Count
         $s.WorstMs = if ($okMs.Count) { [int]$okMs[-1] } else { 0 }
         $emailKind = 'Slow'
-        $emailSubject = "[HST SLOW] $siteLabel - $($bad.Count) of $total polls slow or failed in $WindowMinutes min"
-        $emailBody = New-AlertBody -Heading "HST eChart is slow from $SiteName" -Details ([ordered]@{ 'Status' = 'SLOW'; 'Site' = $SiteName; 'Server' = $HostName; 'Endpoint' = $Url; 'Slow since' = "$($first.LocalStr) local"; "Last $WindowMinutes min" = $windowText; 'Response time' = $timing; 'Last poll' = $lastPoll; 'Backend IP' = $Result.RemoteIp; 'Clears when' = "$ClearPercent% or fewer of the polls in $WindowMinutes min are slow or failed" })
+        $emailSubject = "[SLOW] $siteLabel - $($bad.Count) of $total polls slow or failed in $WindowMinutes min"
+        $emailBody = New-AlertBody -Heading "$what is slow from $SiteName" -Details ([ordered]@{ 'Status' = 'SLOW'; 'Site' = $SiteName; 'Server' = $HostName; 'Endpoint' = $Url; 'Slow since' = "$($first.LocalStr) local"; "Last $WindowMinutes min" = $windowText; 'Response time' = $timing; 'Last poll' = $lastPoll; 'Backend IP' = $Result.RemoteIp; 'Clears when' = "$ClearPercent% or fewer of the polls in $WindowMinutes min are slow or failed" })
         $transitionLog = "Declared SLOW for ${SiteName}: $windowText ($timing)."
         $dropKind = 'SLOWSTART'
     }
@@ -1844,7 +2167,7 @@ function Test-DailySummaryDue {
 
 function Get-DailySummary {
     # Pure. Summarises the drops log lines from the 24 hours before NowLocal. Returns $null when nothing went wrong.
-    param([string[]]$Lines, [Parameter(Mandatory)][datetime]$NowLocal, [int]$SlowThresholdMs = 3000, [string]$SiteName, [string]$HostName, [string]$Url)
+    param([string[]]$Lines, [Parameter(Mandatory)][datetime]$NowLocal, [int]$SlowThresholdMs = 3000, [string]$SiteName, [string]$HostName, [string]$Url, [string]$MonitorName)
     $from = $NowLocal.AddHours(-24)
     $inv = [System.Globalization.CultureInfo]::InvariantCulture
     $failed = 0; $slow = 0; $worst = 0; $downs = 0; $slowPeriods = 0; $restarts = 0; $errors = 0; $open = $false
@@ -1878,6 +2201,7 @@ function Get-DailySummary {
     if (($failed + $slow + $downs + $slowPeriods + $restarts + $errors) -eq 0) { return $null }
     $count = { param([int]$n, [string]$word) if ($n -eq 1) { "1 $word" } else { "$n ${word}s" } }
     $details = [ordered]@{
+        'Monitor'      = $MonitorName
         'Site'         = $SiteName
         'Server'       = $HostName
         'Period'       = "$($from.ToString('yyyy-MM-dd HH:mm')) to $($NowLocal.ToString('yyyy-MM-dd HH:mm')) local"
@@ -1893,10 +2217,10 @@ function Get-DailySummary {
     if ($restarts) { $details['Monitor restarts'] = "$restarts" }
     if ($errors) { $details['Monitor errors'] = "$errors" }
     $details['Endpoint'] = $Url
-    $details['Details'] = "HST-eChart-Drops.log on $HostName"
+    $details['Details'] = "Drops.log on $HostName"
     [PSCustomObject]@{
-        Subject      = "[HST DAILY] $SiteName ($HostName) - $(& $count $slow 'slow poll'), $(& $count $failed 'failed poll'), $(& $count $downs 'outage') in 24 hours"
-        Body         = (New-AlertBody -Heading "HST eChart daily summary for $SiteName" -Details $details)
+        Subject      = "[DAILY] $(Get-AlertLabel -MonitorName $MonitorName -SiteName $SiteName -HostName $HostName) - $(& $count $slow 'slow poll'), $(& $count $failed 'failed poll'), $(& $count $downs 'outage') in 24 hours"
+        Body         = (New-AlertBody -Heading "Daily summary for $(if ($MonitorName) { $MonitorName } else { 'the endpoint' }) at $SiteName" -Details $details)
         SlowPolls    = $slow
         FailedPolls  = $failed
         Outages      = $downs
@@ -2097,7 +2421,7 @@ function Get-RestartNotice {
     # Pure. Compares the previous heartbeat with now. Returns $null when there was no previous heartbeat, else an object
     # with Subject and Body (both $null when the gap is under the threshold), RestoredState (an outage to carry over, or
     # $null), and GapSeconds. A clock that went backwards reads as a gap of zero.
-    param([object]$Previous, [Parameter(Mandatory)][datetime]$NowUtc, [datetime]$BootTimeUtc = [datetime]::MinValue, [Parameter(Mandatory)][int]$GapThresholdSeconds, [Parameter(Mandatory)][int]$IntervalSeconds, [string]$SiteName, [string]$HostName, [string]$Url)
+    param([object]$Previous, [Parameter(Mandatory)][datetime]$NowUtc, [datetime]$BootTimeUtc = [datetime]::MinValue, [Parameter(Mandatory)][int]$GapThresholdSeconds, [Parameter(Mandatory)][int]$IntervalSeconds, [string]$SiteName, [string]$HostName, [string]$Url, [string]$MonitorName)
     if ($null -eq $Previous) { return $null }
     $restored = $null
     if ($Previous.IsDown -and $null -ne $Previous.OutageStartUtc) {
@@ -2114,8 +2438,9 @@ function Get-RestartNotice {
     $cause = if ($BootTimeUtc -eq [datetime]::MinValue) { "Could not read the server boot time." }
              elseif ($BootTimeUtc -gt $Previous.BeatUtc) { "Server restarted at $(& $fmt $BootTimeUtc), after the last heartbeat." }
              else { "Server did not restart (up since $(& $fmt $BootTimeUtc)). The monitor process or its scheduled task stopped, or the server was suspended." }
-    $outage = if ($restored) { "Yes. HST eChart has been down since $($Previous.OutageStartLocalStr) local. Tracking continues from that onset." } else { "None at the last heartbeat." }
+    $outage = if ($restored) { "Yes. It has been down since $($Previous.OutageStartLocalStr) local. Tracking continues from that onset." } else { "None at the last heartbeat." }
     $details = [ordered]@{
+        'Monitor'            = $MonitorName
         'Site'               = $SiteName
         'Server'             = $HostName
         'Last heartbeat'     = (& $fmt $Previous.BeatUtc)
@@ -2128,8 +2453,8 @@ function Get-RestartNotice {
     }
     if ($Previous.IsSlow) { $details['Slow period in progress'] = "Yes, since $($Previous.SlowStartLocalStr) local. Slow tracking starts fresh." }
     [PSCustomObject]@{
-        Subject       = "[HST MONITOR RESTARTED] $SiteName ($HostName) - not running for $gapText"
-        Body          = (New-AlertBody -Heading "HST eChart monitor restarted on $SiteName" -Details $details)
+        Subject       = "[MONITOR RESTARTED] $(Get-AlertLabel -MonitorName $MonitorName -SiteName $SiteName -HostName $HostName) - not running for $gapText"
+        Body          = (New-AlertBody -Heading "$(if ($MonitorName) { "The $MonitorName monitor" } else { 'The monitor' }) restarted on $SiteName" -Details $details)
         Cause         = $cause
         RestoredState = $restored
         Stopped       = $false
@@ -2158,7 +2483,7 @@ function Wait-NetworkReady {
     }
 }
 
-Write-Log -Level STARTED -Message "HST eChart monitor starting for site '$SiteName'. Interval $IntervalSeconds s, timeout $TimeoutSeconds s, down threshold $DownThreshold, mail via $MailMethod."
+Write-Log -Level STARTED -Message "Curl monitor '$MonitorName' starting for site '$SiteName'. Watching $Url every $IntervalSeconds s, timeout $TimeoutSeconds s, down threshold $DownThreshold, mail via $MailMethod."
 
 if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue)) {
     Write-Log -Level FAILED -Message "curl.exe not found. This host needs Windows 10 1803+ or Server 2019+. Exiting."
@@ -2179,6 +2504,8 @@ if (-not (Test-Path $InstallDir)) {
 
 $transcriptPath = Get-TranscriptPath
 Start-Transcript -Path $transcriptPath -Append | Out-Null
+$startupCutoff = (Get-Date).AddDays(-$LogRetentionDays)
+Get-ChildItem -Path $InstallDir -Filter 'Transcript_*.log' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt $startupCutoff } | Remove-Item -Force -ErrorAction SilentlyContinue
 $lastExpiryCheckDate = [datetime]::MinValue
 
 $state = @{ ConsecutiveFailures = 0; IsDown = $false; LastAlertUtc = $null; OutageStartUtc = $null; OutageStartLocalStr = $null; OutageStartUtcStr = $null; AlertDelivered = $null }
@@ -2191,7 +2518,7 @@ try { $bootUtc = ([datetime](Get-CimInstance -ClassName Win32_OperatingSystem -E
 catch { Write-Log -Level WARNING -Message "Could not read the server boot time. $($_.Exception.Message)" }
 $startUtc = (Get-Date).ToUniversalTime()
 $previous = Read-Heartbeat
-$notice = Get-RestartNotice -Previous $previous -NowUtc $startUtc -BootTimeUtc $bootUtc -GapThresholdSeconds ([math]::Max(60, 2 * ($IntervalSeconds + $TimeoutSeconds))) -IntervalSeconds $IntervalSeconds -SiteName $SiteName -HostName $env:COMPUTERNAME -Url $Url
+$notice = Get-RestartNotice -Previous $previous -NowUtc $startUtc -BootTimeUtc $bootUtc -GapThresholdSeconds ([math]::Max(60, 2 * ($IntervalSeconds + $TimeoutSeconds))) -IntervalSeconds $IntervalSeconds -SiteName $SiteName -HostName $env:COMPUTERNAME -Url $Url -MonitorName $MonitorName
 Write-DropLog -Kind 'START' -Message "Monitor started on $env:COMPUTERNAME for site '$SiteName' (poll every $IntervalSeconds s, timeout $TimeoutSeconds s, down after $DownThreshold failures, slow at $SlowAlertPercent% of polls over $SlowThresholdMs ms or failed in $SlowWindowMinutes min)."
 if ($notice) {
     if ($notice.Subject) {
@@ -2202,7 +2529,7 @@ if ($notice) {
     else { Write-Log -Level INFORMATIONAL -Message "Monitor restarted after a $($notice.GapSeconds) s gap, below the notice threshold." }
     if ($notice.RestoredState) {
         $state = $notice.RestoredState
-        Write-Log -Level WARNING -Message "An HST eChart outage was in progress at the last heartbeat (since $($state.OutageStartLocalStr) local). Tracking continues from that onset."
+        Write-Log -Level WARNING -Message "An outage was in progress at the last heartbeat (since $($state.OutageStartLocalStr) local). Tracking continues from that onset."
         Write-DropLog -Kind 'CARRYOVER' -Message "Outage in progress since $($state.OutageStartLocalStr) local carried over from before the restart ($($state.ConsecutiveFailures) failed polls so far)."
     }
 }
@@ -2250,7 +2577,7 @@ try {
             }
 
             Write-Heartbeat -State $state -NowUtc ((Get-Date).ToUniversalTime()) -SlowState $slowState
-            $result = Get-HSTProbeResult
+            $result = Get-ProbeResult
 
             # A non-zero curl exit means the transfer did not complete, even when a 200 status had already arrived
             $failed  = ($result.CurlExit -ne 0) -or ($result.HttpCode -ne '200') -or (-not $result.ContentOk) -or ($null -eq $result.TotalMs)
@@ -2260,7 +2587,7 @@ try {
             elseif ($result.TotalMs -ge $SlowThresholdMs) { Write-Log -Level WARNING -Message "Slow response. $summary"; Write-DropLog -Kind 'SLOW' -Message $summary }
             else { Write-Log -Level SUCCESS -Message $summary }
 
-            $decision = Update-MonitorState -State $state -Failed $failed -Result $result -NowUtc ((Get-Date).ToUniversalTime()) -DownThreshold $DownThreshold -ReAlertMinutes $ReAlertMinutes -AlertOnRecovery $AlertOnRecovery -SiteName $SiteName -Url $Url -HostName $env:COMPUTERNAME
+            $decision = Update-MonitorState -State $state -Failed $failed -Result $result -NowUtc ((Get-Date).ToUniversalTime()) -DownThreshold $DownThreshold -ReAlertMinutes $ReAlertMinutes -AlertOnRecovery $AlertOnRecovery -SiteName $SiteName -Url $Url -HostName $env:COMPUTERNAME -MonitorName $MonitorName
             $state = $decision.State
 
             if ($decision.TransitionLog) { Write-Log -Level ADDED -Message $decision.TransitionLog }
@@ -2273,7 +2600,7 @@ try {
                 if ($ok -and $decision.EmailKind -in @('Down','Reminder')) { $state.AlertDelivered = $true }
             }
 
-            $slow = Update-SlowState -State $slowState -Result $result -Failed $failed -IsDown $state.IsDown -NowUtc ((Get-Date).ToUniversalTime()) -SlowThresholdMs $SlowThresholdMs -WindowMinutes $SlowWindowMinutes -AlertPercent $SlowAlertPercent -ClearPercent $SlowClearPercent -ReAlertMinutes $ReAlertMinutes -AlertOnRecovery $AlertOnRecovery -SiteName $SiteName -Url $Url -HostName $env:COMPUTERNAME
+            $slow = Update-SlowState -State $slowState -Result $result -Failed $failed -IsDown $state.IsDown -NowUtc ((Get-Date).ToUniversalTime()) -SlowThresholdMs $SlowThresholdMs -WindowMinutes $SlowWindowMinutes -AlertPercent $SlowAlertPercent -ClearPercent $SlowClearPercent -ReAlertMinutes $ReAlertMinutes -AlertOnRecovery $AlertOnRecovery -SiteName $SiteName -Url $Url -HostName $env:COMPUTERNAME -MonitorName $MonitorName
             $slowState = $slow.State
             if ($slow.TransitionLog) { Write-Log -Level ADDED -Message $slow.TransitionLog; Write-DropLog -Kind $slow.DropKind -Message $slow.TransitionLog }
             if ($AlertOnSlow -and $slow.EmailSubject) {
@@ -2286,8 +2613,16 @@ try {
                 try { Set-Content -Path $SummaryStateFile -Value $summarySent -Encoding ASCII -ErrorAction Stop }
                 catch { Write-Log -Level WARNING -Message "Could not record the daily summary date in '$SummaryStateFile'. $($_.Exception.Message)" }
                 $dropLines = @()
-                try { if (Test-Path $DropLog) { $dropLines = @(Get-Content -Path $DropLog -ErrorAction Stop) } } catch { Write-Log -Level WARNING -Message "Could not read the drops log for the daily summary. $($_.Exception.Message)" }
-                $summary = Get-DailySummary -Lines $dropLines -NowLocal (Get-Date) -SlowThresholdMs $SlowThresholdMs -SiteName $SiteName -HostName $env:COMPUTERNAME -Url $Url
+                try {
+                    # A rotation past the size limit splits the day across files, so read every log the window touches
+                    $cutoff = (Get-Date).AddHours(-24)
+                    foreach ($f in @(Get-ChildItem -Path $InstallDir -Filter 'Drops_*.log' -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -ge $cutoff } | Sort-Object Name)) {
+                        $dropLines += @(Get-Content -Path $f.FullName -ErrorAction Stop)
+                    }
+                    if (Test-Path $DropLog) { $dropLines += @(Get-Content -Path $DropLog -ErrorAction Stop) }
+                }
+                catch { Write-Log -Level WARNING -Message "Could not read the drops log for the daily summary. $($_.Exception.Message)" }
+                $summary = Get-DailySummary -Lines $dropLines -NowLocal (Get-Date) -SlowThresholdMs $SlowThresholdMs -SiteName $SiteName -HostName $env:COMPUTERNAME -Url $Url -MonitorName $MonitorName
                 if ($summary) {
                     Write-Log -Level INFORMATIONAL -Message "Daily summary: $($summary.Subject)"
                     Send-AlertOrQueue -Subject $summary.Subject -Body $summary.Body -Kind 'Summary' | Out-Null
@@ -2309,13 +2644,13 @@ try {
     }
 }
 finally {
-    Write-Log -Level FINISHED -Message "HST eChart monitor stopping for site '$SiteName'."
+    Write-Log -Level FINISHED -Message "Curl monitor '$MonitorName' stopping for site '$SiteName'."
     Write-DropLog -Kind 'STOP' -Message "Monitor stopping for site '$SiteName'."
     try { Stop-Transcript | Out-Null } catch { }
 }
 '@
 
-Write-Log -Level STARTED -Message "HST monitor self-installer starting."
+Write-Log -Level STARTED -Message "Curl monitor self-installer starting."
 
 # A PowerShell 7 window puts its own module folders first in PSModulePath. Windows PowerShell then finds the wrong
 # Microsoft.PowerShell.Security and cannot load it, so ConvertTo-SecureString goes missing. Keep only its own paths.
@@ -2337,6 +2672,35 @@ if (-not (Get-Command Register-ScheduledTask -ErrorAction SilentlyContinue)) {
 }
 Write-Log -Level "SANITY CHECK" -Message "ScheduledTasks module present."
 
+if (-not (Test-Path $InstallRoot)) {
+    try {
+        New-Item -Path $InstallRoot -ItemType Directory -Force | Out-Null
+        Write-Log -Level CREATED -Message "Created install root '$InstallRoot'."
+    }
+    catch {
+        Write-Log -Level FAILED -Message "Could not create install root '$InstallRoot'. $($_.Exception.Message). Exiting."
+        exit 1
+    }
+}
+
+# An older HST-only install is offered a migration before anything else, so its settings prefill the prompts
+$existingMonitors = @(Get-InstalledMonitor)
+$legacy = Get-LegacyInstall
+$migrate = $false
+if ($legacy) {
+    Write-Log -Level FOUND -Message "Found an older install at '$($legacy.Dir)'$(if ($legacy.HasTask) { " with task '$($legacy.TaskPath)$($legacy.TaskName)'" } else { '' })."
+    Write-Log -Level INFORMATIONAL -Message "Migrating stops and removes that task, copies its settings, latency history, outages, and drops log into the new layout, then deletes the old folder. One monitor keeps running, so no duplicate alerts. It happens at the end, once this run has everything it needs."
+    $migrate = if ($NonInteractive) { $true } else { (Read-Choice -Prompt "Migrate it now? Y = migrate, N = leave it where it is" -Allowed @('Y','N') -Default 'Y') -eq 'Y' }
+}
+
+$MonitorName = Get-MonitorName -SavedDefault $(if ($migrate) { $LegacyMonitorName } else { "" }) -Existing $existingMonitors
+if (-not $MonitorName) {
+    Write-Log -Level FAILED -Message "No monitor name. Nothing was installed. Exiting."
+    exit 1
+}
+$InstallDir = Join-Path $InstallRoot (ConvertTo-MonitorSlug $MonitorName)
+$TaskName   = "$TaskNamePrefix$MonitorName"
+
 if (-not (Test-Path $InstallDir)) {
     try {
         New-Item -Path $InstallDir -ItemType Directory -Force | Out-Null
@@ -2348,9 +2712,11 @@ if (-not (Test-Path $InstallDir)) {
     }
 }
 try {
-    Protect-InstallFolder -Path (Split-Path -Path $InstallDir -Parent) -OwnerOnly
+    Protect-InstallFolder -Path (Split-Path -Path $InstallRoot -Parent) -OwnerOnly
+    Protect-InstallFolder -Path $InstallRoot
     Protect-InstallFolder -Path $InstallDir
-    Write-Log -Level "SANITY CHECK" -Message "Install folder locked to SYSTEM and Administrators (Users read-only)."
+    Protect-StoredSecret -Root $InstallRoot
+    Write-Log -Level "SANITY CHECK" -Message "Install folder locked to SYSTEM and Administrators (Users read-only), stored secrets locked to SYSTEM and Administrators only."
 }
 catch {
     Write-Log -Level FAILED -Message "Could not secure the install folder. $($_.Exception.Message) Exiting."
@@ -2358,9 +2724,19 @@ catch {
 }
 
 $saved = Get-InstallSettings
+if (-not $saved -and $legacy -and $legacy.Settings) {
+    $saved = $legacy.Settings
+    Write-Log -Level FOUND -Message "Prompts default to the older install's settings."
+}
 $site  = Get-SiteName -SavedDefault $(if ($saved -and $saved.SiteName) { $saved.SiteName } else { "" })
+$Url   = Get-MonitorUrl -SavedDefault $(if ($saved -and $saved.Url) { [string]$saved.Url } else { "" })
+if (-not $Url) {
+    Write-Log -Level FAILED -Message "No URL to watch. Nothing was installed. Exiting."
+    exit 1
+}
+$ExpectedContentMarker = Get-ContentMarker -SavedDefault $(if ($saved -and $saved.ContentMarker) { [string]$saved.ContentMarker } else { "" })
 
-$mail = Get-MailConfiguration -Saved $saved -SiteName $site
+$mail = Get-MailConfiguration -Saved $saved -SiteName $site -MonitorName $MonitorName
 if (-not $mail) {
     Write-Log -Level FAILED -Message "Mail configuration incomplete. Nothing was installed. Exiting."
     exit 1
@@ -2395,6 +2771,7 @@ else {
 
 # Saved now so a failure below still prefills the next run. InstalledAt is added only once the task is running.
 $settings = @{
+    MonitorName  = $MonitorName
     SiteName     = $site
     MailMethod   = $mail.MailMethod
     SmtpServer   = $mail.SmtpServer
@@ -2406,7 +2783,8 @@ $settings = @{
     GraphTenantId      = $mail.GraphTenantId
     GraphClientId      = $mail.GraphClientId
     GraphSecretExpires = $mail.GraphSecretExpires
-    Url          = $Url
+    Url           = $Url
+    ContentMarker = $ExpectedContentMarker
 }
 Save-InstallSettings -Settings $settings
 
@@ -2441,7 +2819,7 @@ if ($existing) {
             Write-Log -Level INFORMATIONAL -Message "Stopped the existing monitor for a clean reinstall."
             # This stop is deliberate: mark the heartbeat so the new copy sends no restart notice, while any outage in
             # progress stays recorded and carries over. The drops log gets the stop the monitor could not write itself.
-            $hbPath = Join-Path $InstallDir 'monitor-heartbeat.json'
+            $hbPath = Join-Path $InstallDir 'heartbeat.json'
             if (Test-Path $hbPath) {
                 try {
                     $hb = Get-Content -Path $hbPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
@@ -2450,7 +2828,7 @@ if ($existing) {
                 }
                 catch { Remove-Item -Path $hbPath -Force -ErrorAction SilentlyContinue }
             }
-            try { Add-Content -Path (Join-Path $InstallDir 'HST-eChart-Drops.log') -Value ("{0} | {1,-9} | {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), 'STOP', "Monitor stopped by the installer on $env:COMPUTERNAME for a reinstall.") -Encoding UTF8 -ErrorAction Stop } catch { }
+            try { Add-Content -Path (Join-Path $InstallDir 'Drops.log') -Value ("{0} | {1,-9} | {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), 'STOP', "Monitor stopped by the installer on $env:COMPUTERNAME for a reinstall.") -Encoding UTF8 -ErrorAction Stop } catch { }
         }
         else { Write-Log -Level WARNING -Message "The existing monitor task was not running. The new copy will report how long it was down." }
     }
@@ -2464,6 +2842,18 @@ try {
 catch {
     Write-Log -Level FAILED -Message "Could not replace the monitor script at '$monitorPath'. $($_.Exception.Message). Exiting."
     exit 1
+}
+
+# Only now, with mail settled and the monitor written, is the old install taken apart. An abort before this point
+# leaves it running, so the server is never left with nothing watching.
+if ($migrate) {
+    if (Invoke-LegacyMigration -Legacy $legacy -Destination $InstallDir) {
+        Write-Log -Level FINISHED -Message "Migration complete: '$($legacy.Dir)' is gone and its history lives in '$InstallDir'."
+    }
+    else {
+        Write-Log -Level WARNING -Message "Migration did not finish. The old folder '$($legacy.Dir)' is still there and its task is not running. Nothing was lost, and this monitor takes over from here."
+    }
+    Protect-StoredSecret -Root $InstallRoot
 }
 
 try {
@@ -2508,7 +2898,7 @@ if ($taskState -eq 'Running') {
 }
 
 $reach = Test-EndpointReachable
-if ($reach.Reachable) { Write-Log -Level FOUND -Message "Preflight probe reached the sign-in page from '$site' (HTTP $($reach.HttpCode) after $($reach.Redirects) redirect(s))." }
+if ($reach.Reachable) { Write-Log -Level FOUND -Message "Preflight probe reached '$Url' from '$site' (HTTP $($reach.HttpCode) after $($reach.Redirects) redirect(s))." }
 else { Write-Log -Level WARNING -Message "Preflight probe did not get HTTP 200 from '$site' (got '$($reach.HttpCode)' after $($reach.Redirects) redirect(s), final URL '$($reach.FinalUrl)'). The monitor is installed and will keep trying." }
 
 if ($SendInstallTestEmail) {
@@ -2523,9 +2913,9 @@ if ($SendInstallTestEmail) {
         if ($plain) { $cred = New-Object System.Management.Automation.PSCredential($mail.SmtpAuthUser, (ConvertTo-SecureText -Text $plain)) }
         else { $canSend = $false; Write-Log -Level WARNING -Message "Could not read back the stored SMTP password. Skipping the install confirmation email." }
     }
-    $body = New-AlertBody -Heading "HST eChart monitor installed" -Details ([ordered]@{ 'Site' = $site; 'Server' = $env:COMPUTERNAME; 'Endpoint' = $Url; 'Task' = "$TaskPath$TaskName ($taskState)"; 'Preflight' = "HTTP $($reach.HttpCode) after $($reach.Redirects) redirect(s)"; 'Alerts via' = "$($mail.MailMethod) from $($mail.MailFrom)"; 'Down alert' = "After $DownThreshold failed polls in a row"; 'Slow alert' = $(if ($AlertOnSlow) { "When $SlowAlertPercent% of polls in $SlowWindowMinutes min are slower than $SlowThresholdMs ms or fail" } else { 'Off' }); 'Daily summary' = $(if ($DailySummaryHour -ge 0) { "At $('{0:00}' -f $DailySummaryHour):00 when anything was slow or failed" } else { 'Off' }); 'Installed' = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') }) -Footer "Sent by the HST eChart monitor installer on $env:COMPUTERNAME."
+    $body = New-AlertBody -Heading "Curl monitor '$MonitorName' installed" -Details ([ordered]@{ 'Monitor' = $MonitorName; 'Site' = $site; 'Server' = $env:COMPUTERNAME; 'Endpoint' = $Url; 'Task' = "$TaskPath$TaskName ($taskState)"; 'Preflight' = "HTTP $($reach.HttpCode) after $($reach.Redirects) redirect(s)"; 'Alerts via' = "$($mail.MailMethod) from $($mail.MailFrom)"; 'Down alert' = "After $DownThreshold failed polls in a row"; 'Slow alert' = $(if ($AlertOnSlow) { "When $SlowAlertPercent% of polls in $SlowWindowMinutes min are slower than $SlowThresholdMs ms or fail" } else { 'Off' }); 'Daily summary' = $(if ($DailySummaryHour -ge 0) { "At $('{0:00}' -f $DailySummaryHour):00 when anything was slow or failed" } else { 'Off' }); 'Installed' = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') }) -Footer "Sent by the curl monitor installer on $env:COMPUTERNAME."
     if ($script:MailTestSkipped) { Write-Log -Level WARNING -Message "Install confirmation email skipped: the test email failed and was skipped. The monitor sends alerts on its own once the mail path works." }
-    elseif ($canSend -and (Send-MailWithConfig -Mail $mail -Subject "[HST MONITOR INSTALLED] $site ($env:COMPUTERNAME)" -Body $body -Credential $cred -GraphSecret $graphSecret -MaxWaitSeconds 120)) {
+    elseif ($canSend -and (Send-MailWithConfig -Mail $mail -Subject "[MONITOR INSTALLED] $(Get-AlertLabel -MonitorName $MonitorName -SiteName $site -HostName $env:COMPUTERNAME)" -Body $body -Credential $cred -GraphSecret $graphSecret -MaxWaitSeconds 120)) {
         Write-Log -Level INFORMATIONAL -Message "Install confirmation email sent."
     }
     elseif ($canSend) { Write-Log -Level WARNING -Message "Install confirmation email not sent. The monitor sends alerts on its own once the mail path works." }
@@ -2533,11 +2923,13 @@ if ($SendInstallTestEmail) {
 
 Write-Host ""
 Write-Host "Install summary"
+Write-Host "  Monitor         : $MonitorName"
 Write-Host "  Site            : $site"
-Write-Host "  Endpoint        : $Url"
+Write-Host "  URL             : $Url"
+Write-Host "  Healthy poll    : HTTP 200, at least $MinPopulatedBytes bytes$(if ($ExpectedContentMarker) { ", containing '$ExpectedContentMarker'" } else { '' })"
 Write-Host "  Task            : $TaskPath$TaskName ($taskState, runs as $RunAsUser at startup)"
 Write-Host "  Monitor         : $monitorPath"
-Write-Host "  Data folder     : $InstallDir  (latency CSV monthly, HST-eChart-Outages.csv, HST-eChart-Drops.log, daily logs)"
+Write-Host "  Data folder     : $InstallDir  (Latency_yyyyMM.csv, Outages.csv, Drops.log, daily transcripts)"
 Write-Host "  Alerts          : $($mail.MailMethod) from $($mail.MailFrom) to $($mail.MailTo -join ', ')"
 Write-Host "  Down alert      : after $DownThreshold failed polls in a row"
 Write-Host "  Slow alert      : $(if ($AlertOnSlow) { "when $SlowAlertPercent% of polls in $SlowWindowMinutes min are slower than $SlowThresholdMs ms or fail" } else { 'off (slow periods are still logged)' })"
@@ -2553,4 +2945,4 @@ if ($taskState -ne 'Running') {
     Write-Log -Level FAILED -Message "Install finished but the monitor task is not running (state '$taskState'). Fix the task in Task Scheduler or re-run the installer."
     exit 1
 }
-Write-Log -Level FINISHED -Message "Install complete for site '$site'."
+Write-Log -Level FINISHED -Message "Install complete: '$MonitorName' at site '$site' watching $Url."
